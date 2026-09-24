@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<module>
+  <rawname>domaintains</rawname>
+  <name>DOMAINTAINS</name>
+  <version>0.1.0</version>
+  <publisher>FreePBX UK</publisher>
+  <license>GPLv3+</license>
+  <licenselink>https://www.gnu.org/licenses/gpl-3.0.txt</licenselink>
+  <category>Connectivity</category>
+  <description>PBX-side module for FreePBX 16 and 17, providing SIP trunking and numbering integration with DOMAINTAINS SBCs via FreePBX UK's my-connect.</description>
+  <more-info>https://github.com/kierknoby/domaintains</more-info>
+
+  <changelog>
+    *0.1.0* Initial development scaffold. Adds FreePBX 16/17 module metadata, a minimal DOMAINTAINS GUI, and the fwconsole domaintains status command. No provisioning actions are implemented yet.
+  </changelog>
+
+  <menuitems>
+    <domaintains>DOMAINTAINS</domaintains>
+  </menuitems>
+
+  <depends>
+    <version>16.0</version>
+  </depends>
+
+  <supported>
+    <version>16.0</version>
+    <version>17.0</version>
+  </supported>
+</module>
