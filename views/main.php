@@ -4,6 +4,8 @@
  *
  * @var string $moduleVersion
  * @var array $status
+ * @var string $activationCsrfToken
+ * @var array $activationMessage
  */
 if (!defined('FREEPBX_IS_AUTH')) {
 	die('No direct script access allowed');
@@ -12,14 +14,16 @@ if (!defined('FREEPBX_IS_AUTH')) {
 $moduleVersion = isset($moduleVersion) ? (string)$moduleVersion : '';
 $status = isset($status) && is_array($status) ? $status : [];
 $state = isset($status['state']) ? (string)$status['state'] : 'unknown';
-$stateLabel = $state === 'unprovisioned' ? _('Not provisioned') : ucfirst($state);
+$stateLabel = $state === 'unprovisioned' ? _('Not activated') : ucfirst($state);
+$activationCsrfToken = isset($activationCsrfToken) ? (string)$activationCsrfToken : '';
+$activationMessage = isset($activationMessage) && is_array($activationMessage) ? $activationMessage : [];
 ?>
 <div class="fpbx-container">
 	<div class="row">
 		<div class="col-md-12">
 			<h2><?php echo _('DOMAINTAINS'); ?></h2>
 			<p class="help-block">
-				<?php echo _('PBX-side SIP trunking and numbering integration for DOMAINTAINS services, orchestrated through FreePBX UK\'s my-connect.'); ?>
+				<?php echo _('Connect this FreePBX installation to your DOMAINTAINS service.'); ?>
 			</p>
 		</div>
 	</div>
@@ -36,10 +40,6 @@ $stateLabel = $state === 'unprovisioned' ? _('Not provisioned') : ucfirst($state
 								<td><?php echo htmlspecialchars($stateLabel, ENT_QUOTES, 'UTF-8'); ?></td>
 							</tr>
 							<tr>
-								<th><?php echo _('Remote bridge'); ?></th>
-								<td>my-connect</td>
-							</tr>
-							<tr>
 								<th><?php echo _('Module version'); ?></th>
 								<td><?php echo htmlspecialchars($moduleVersion, ENT_QUOTES, 'UTF-8'); ?></td>
 							</tr>
@@ -50,8 +50,36 @@ $stateLabel = $state === 'unprovisioned' ? _('Not provisioned') : ucfirst($state
 		</div>
 	</div>
 
-	<div class="alert alert-info" role="alert">
-		<strong><?php echo _('Development scaffold'); ?></strong><br>
-		<?php echo _('This release reports module status only. SIP trunk, routing, numbering, verification and removal actions are not implemented yet.'); ?>
-	</div>
+	<?php if (!empty($activationMessage['message'])): ?>
+		<div class="alert <?php echo !empty($activationMessage['success']) ? 'alert-success' : 'alert-danger'; ?>" role="alert">
+			<?php echo htmlspecialchars((string)$activationMessage['message'], ENT_QUOTES, 'UTF-8'); ?>
+		</div>
+	<?php endif; ?>
+
+	<?php if (empty($status['provisioned']) && $state !== 'error'): ?>
+		<div class="row">
+			<div class="col-md-8">
+				<div class="panel panel-default">
+					<div class="panel-heading"><strong><?php echo _('Activate DOMAINTAINS'); ?></strong></div>
+					<div class="panel-body">
+						<form method="post" class="form-horizontal" autocomplete="off">
+							<input type="hidden" name="domaintains_action" value="activate">
+							<input type="hidden" name="domaintains_csrf" value="<?php echo htmlspecialchars($activationCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
+							<div class="form-group">
+								<label for="activation-key" class="col-sm-3 control-label"><?php echo _('Activation key'); ?></label>
+								<div class="col-sm-9">
+									<input type="password" class="form-control" id="activation-key" name="activation_key" required autocomplete="new-password">
+								</div>
+							</div>
+							<div class="form-group">
+								<div class="col-sm-offset-3 col-sm-9">
+									<button type="submit" class="btn btn-primary"><?php echo _('Activate'); ?></button>
+								</div>
+							</div>
+						</form>
+					</div>
+				</div>
+			</div>
+		</div>
+	<?php endif; ?>
 </div>

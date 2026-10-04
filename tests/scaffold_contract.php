@@ -16,20 +16,30 @@ $view = file_get_contents($root . '/views/main.php');
 $readme = file_get_contents($root . '/README.md');
 
 scaffold_assert(strpos($module, 'class Domaintains implements \\BMO') !== false, 'BMO class should exist');
-scaffold_assert(strpos($module, "'state' => 'unprovisioned'") !== false, 'initial state should be unprovisioned');
-scaffold_assert(strpos($module, "'provisioned' => false") !== false, 'initial scaffold should not claim provisioning');
+scaffold_assert(strpos($module, 'readActivationState()') !== false, 'status should read persisted activation state');
+scaffold_assert(strpos($module, 'public function activate(string $activationKey)') !== false, 'module should expose shared activation method');
+scaffold_assert(strpos($module, 'reconcileLocalConfiguration(') !== false, 'activation should reconcile local FreePBX configuration');
 scaffold_assert(strpos($page, '\\FreePBX::Domaintains()->showPage()') !== false, 'page controller should use the DOMAINTAINS BMO');
-scaffold_assert(strpos($view, 'Development scaffold') !== false, 'GUI should clearly identify development scaffold');
-scaffold_assert(strpos($console, "if (\$action !== 'status')") !== false, 'CLI should reject unimplemented actions');
-scaffold_assert(strpos($readme, 'my-connect is') !== false, 'README should distinguish my-connect from DOMAINTAINS');
+scaffold_assert(strpos($view, 'name="activation_key"') !== false, 'GUI should provide an activation key field');
+scaffold_assert(strpos($view, 'name="domaintains_csrf"') !== false, 'GUI activation should include CSRF protection');
+scaffold_assert(strpos($console, "->activate(\$key)") !== false, 'CLI should use the shared module activation method');
+scaffold_assert(strpos($console, "addArgument('activation-key'") === false, 'CLI must not accept an activation key as an argument');
+scaffold_assert(strpos($console, 'setHidden(true)') !== false && strpos($console, 'setHiddenFallback(false)') !== false, 'CLI must prompt with hidden input and fail if hidden input is unsupported');
+scaffold_assert(strpos($readme, "fwconsole domaintains activate\n") !== false, 'README should document activation without a key argument');
+scaffold_assert(strpos($readme, '<activation-key>') === false, 'README must not show an activation key on a command line');
+scaffold_assert(strpos($module, "'token' => \$activationKey") !== false, 'activation claim should carry the supplied key');
+scaffold_assert(strpos($module, 'sodium_crypto_sign_detached') !== false, 'activation request should use detached Ed25519 signing');
+scaffold_assert(strpos($module, 'random_bytes(24)') !== false, 'activation nonce should use secure random bytes');
+scaffold_assert(strpos($module, "'/signing.key'") !== false, 'local signing key should be persisted');
+scaffold_assert(strpos($module, "'/state.json'") !== false, 'activation state should be persisted');
 
 $forbidden = [
 	'core_trunks_edit(',
-	'addTrunk(',
 	'createUpdateDID(',
 	'fwconsole reload',
 	'shell_exec(',
-	'exec(',
+	'passthru(',
+	'system(',
 ];
 
 foreach ($forbidden as $needle) {
@@ -39,6 +49,6 @@ foreach ($forbidden as $needle) {
 	}
 }
 
-scaffold_assert(!file_exists($root . '/module.sig'), 'module.sig should not exist in the unsigned scaffold');
+scaffold_assert(!file_exists($root . '/module.sig'), 'module.sig should not exist in this repository');
 
 echo "Scaffold contract passed.\n";

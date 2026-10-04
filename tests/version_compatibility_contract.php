@@ -21,7 +21,7 @@ $xml = file_get_contents($root . '/module.xml');
 compatibility_assert($xml !== false && $xml !== '', 'module.xml should be readable');
 compatibility_assert(xml_first($xml, 'rawname') === 'domaintains', 'raw module name should be domaintains');
 compatibility_assert(xml_first($xml, 'name') === 'DOMAINTAINS', 'display name should be DOMAINTAINS');
-compatibility_assert(xml_first($xml, 'version') === '0.1.0', 'module version should be 0.1.0');
+compatibility_assert(xml_first($xml, 'version') === '0.2.0', 'module version should be 0.2.0');
 compatibility_assert(xml_first($xml, 'publisher') === 'FreePBX UK', 'publisher should be FreePBX UK');
 compatibility_assert(xml_first($xml, 'license') === 'GPLv3+', 'module licence metadata should be GPLv3+');
 
@@ -57,10 +57,11 @@ $readme = file_get_contents($root . '/README.md');
 $moduleClass = file_get_contents($root . '/Domaintains.class.php');
 $consoleClass = file_get_contents($root . '/Console/Domaintains.class.php');
 
-compatibility_assert(strpos($readme, 'FreePBX/PBXact 16 or 17') !== false, 'README compatibility should cover FreePBX/PBXact 16 and 17');
+compatibility_assert(strpos($readme, 'FreePBX 16 and 17') !== false, 'README compatibility should cover FreePBX 16 and 17');
 compatibility_assert(strpos($moduleClass, 'FreePBX 16 and 17') !== false, 'module documentation should identify FreePBX 16 and 17 support');
 compatibility_assert(strpos($consoleClass, "->setName('domaintains')") !== false, 'fwconsole command should be named domaintains');
-compatibility_assert(strpos($consoleClass, "'status'") !== false, 'initial CLI should implement status');
+compatibility_assert(strpos($consoleClass, "'status'") !== false, 'CLI should implement status');
+compatibility_assert(strpos($consoleClass, "'activate'") !== false, 'CLI should implement activation');
 compatibility_assert(!file_exists($root . '/module.sig'), 'development scaffold must not include a copied module signature');
 
 echo "Version compatibility contract passed.\n";

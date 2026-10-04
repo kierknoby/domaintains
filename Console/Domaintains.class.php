@@ -2,10 +2,8 @@
 /**
  * fwconsole domaintains command.
  *
- * Initial scaffold:
- *   fwconsole domaintains
- *   fwconsole domaintains status
- *   fwconsole domaintains status --json
+ *   fwconsole domaintains status [--json]
+ *   fwconsole domaintains activate
  */
 
 namespace FreePBX\Console\Command;
@@ -15,13 +13,14 @@ use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Question\Question;
 
 class Domaintains extends Command {
 
 	protected function configure() {
 		$this->setName('domaintains')
-			->setDescription('Inspect and manage DOMAINTAINS PBX-side connectivity')
-			->addArgument('action', InputArgument::OPTIONAL, 'Action: status', 'status')
+			->setDescription('Activate DOMAINTAINS and inspect local activation status')
+			->addArgument('action', InputArgument::OPTIONAL, 'Action: status or activate', 'status')
 			->addOption('json', null, InputOption::VALUE_NONE, 'Return machine-readable JSON');
 	}
 
@@ -31,8 +30,28 @@ class Domaintains extends Command {
 			$action = 'status';
 		}
 
+		if ($action === 'activate') {
+			$question = new Question('Activation key: ');
+			$question->setHidden(true);
+			$question->setHiddenFallback(false);
+			try {
+				$key = (string)$this->getHelper('question')->ask($input, $output, $question);
+			} catch (\RuntimeException $e) {
+				$output->writeln('<error>Unable to read the activation key securely.</error>');
+				return 1;
+			}
+			if (trim($key) === '') {
+				$output->writeln('<error>An activation key is required.</error>');
+				return 1;
+			}
+			$result = \FreePBX::Domaintains()->activate($key);
+			$key = '';
+			$output->writeln(($result['success'] ? '<info>' : '<error>') . $result['message'] . ($result['success'] ? '</info>' : '</error>'));
+			return $result['success'] ? 0 : 1;
+		}
+
 		if ($action !== 'status') {
-			$output->writeln('<error>Unknown action. The initial DOMAINTAINS scaffold supports status only.</error>');
+			$output->writeln('<error>Unknown action. Use status or activate.</error>');
 			return 1;
 		}
 
@@ -52,7 +71,6 @@ class Domaintains extends Command {
 		$output->writeln('Version: ' . $status['version']);
 		$output->writeln('State: ' . $status['state']);
 		$output->writeln('Provisioned: ' . ($status['provisioned'] ? 'yes' : 'no'));
-		$output->writeln('Remote bridge: ' . $status['bridge']);
 		$output->writeln('FreePBX support: ' . implode(' and ', $status['freepbx_support']));
 
 		return 0;

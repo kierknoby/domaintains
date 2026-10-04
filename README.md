@@ -1,113 +1,33 @@
-# DOMAINTAINS 0.1.0 for FreePBX 16 and 17
+# DOMAINTAINS 0.2.0
 
-DOMAINTAINS (`domaintains`) is the PBX-side module for FreePBX/PBXact 16 and 17,
-providing SIP trunking and numbering integration with DOMAINTAINS SBCs via
-FreePBX UK's **my-connect** remote bridge.
+DOMAINTAINS is a FreePBX module for FreePBX 16 and 17.
 
-DOMAINTAINS is the product/service/module installed on the PBX. **my-connect is
-separate**: it is the remote bridge and orchestration layer used by FreePBX UK
-to coordinate the PBX-side module with DOMAINTAINS infrastructure.
+## Activate
 
-## Development status
-
-Version 0.1.0 is an initial development scaffold. It intentionally implements
-only module loading, a minimal GUI status page, and the `fwconsole domaintains
-status` command. It does **not** yet create, modify or remove trunks, routes,
-numbering or SBC configuration.
-
-This development build is unsigned and should not be treated as a production
-release.
-
-## Compatibility
-
-Use with FreePBX/PBXact 16 or 17.
-
-## Current CLI
+Request an activation key from your service provider. In FreePBX, open
+**Connectivity > DOMAINTAINS**, enter the key, and select **Activate**. The CLI
+also supports activation:
 
 ```sh
-fwconsole domaintains
-fwconsole domaintains status
-fwconsole domaintains status --json
+fwconsole domaintains activate
 ```
 
-The default action is `status`.
+The command securely prompts for the key without displaying it. Do not place
+the key in the command itself. Activation connects to the DOMAINTAINS
+activation service. The module creates a local signing identity and does not
+retain the activation key after successful activation.
 
-Expected human-readable output begins with:
-
-```text
-DOMAINTAINS
-===========
-Version: 0.1.0
-State: unprovisioned
-Provisioned: no
-Remote bridge: my-connect
-FreePBX support: 16 and 17
-```
-
-The JSON form exists from the first scaffold so my-connect can later consume a
-stable machine-readable status without scraping terminal output.
-
-## Architecture
-
-```text
-WHMCS
-  |
-  | signed provisioning request
-  v
-my-connect
-  |
-  +--> DOMAINTAINS SBC infrastructure
-  |
-  +--> DOMAINTAINS module on the customer PBX
-         |
-         +--> FreePBX APIs locally
-```
-
-The intended separation of responsibility is:
-
-- **WHMCS** knows the customer, service and commercial configuration.
-- **my-connect** is the remote bridge and orchestrator.
-- **DOMAINTAINS** owns and validates PBX-side configuration through local
-  FreePBX APIs.
-- **DOMAINTAINS SBCs** own SBC-side SIP and routing configuration.
-
-The PBX module is intended to expose narrow, allowlisted operations rather than
-arbitrary PHP, SQL or shell execution.
-
-## Planned provisioning interface
-
-The following commands are planned but are **not implemented in 0.1.0**:
-
-```text
-fwconsole domaintains provision
-fwconsole domaintains verify
-fwconsole domaintains remove
-```
-
-The provisioning path will be built from the already-proven FreePBX-native
-trunk and outbound-route operations. Re-running the same desired configuration
-must be safe and idempotent.
-
-## Installing the development scaffold
-
-Place the `domaintains` directory in `/var/www/html/admin/modules/`, then run:
-
-```sh
-cd /var/www/html/admin/modules/domaintains
-fwconsole ma install domaintains
-cd
-fwconsole chown
-fwconsole reload
-```
-
-The module appears under **Connectivity > DOMAINTAINS**.
-
-Then verify the CLI:
+After authorization, the module reconciles and verifies its local SIP trunk and
+outbound route configuration. It requires PHP sodium and HTTPS support. Check
+activation status with:
 
 ```sh
 fwconsole domaintains status
 fwconsole domaintains status --json
 ```
+
+An activated installation cannot be linked to another service identity from
+the module.
 
 ## Repository
 
@@ -119,18 +39,15 @@ GPL-3.0-or-later. See `LICENSE`.
 
 ## AI-Assisted Contributions and Disclosure
 
-This module may be developed with AI assistance for code generation, review,
-testing and documentation. Generative AI assistance must be disclosed in every
-commit containing AI-assisted changes:
+AI-assisted changes must be disclosed in each commit containing those changes.
+Use a commit trailer such as:
 
 ```text
-Assisted-by: AGENT_NAME:MODEL_VERSION
+Assisted-by: TOOL_NAME:MODEL_VERSION
 ```
 
-For example: `Assisted-by: GitHub-Copilot:gpt-5.6-sol`
-
-The human contributor remains solely responsible for the contribution. AI tools
-must not be listed as co-authors.
+The human contributor remains responsible for the contribution. AI tools must
+not be listed as co-authors.
 
 ## Author
 
