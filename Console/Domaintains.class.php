@@ -47,6 +47,9 @@ class Domaintains extends Command {
 			$result = \FreePBX::Domaintains()->activate($key);
 			$key = '';
 			$output->writeln(($result['success'] ? '<info>' : '<error>') . $result['message'] . ($result['success'] ? '</info>' : '</error>'));
+			if (!$result['success'] && isset($result['stage']) && $output->getVerbosity() >= OutputInterface::VERBOSITY_VERBOSE) {
+				$output->writeln($result['stage'] === 'local' ? 'Stage: local reconciliation' : 'Stage: remote activation');
+			}
 			return $result['success'] ? 0 : 1;
 		}
 
@@ -71,6 +74,10 @@ class Domaintains extends Command {
 		$output->writeln('Version: ' . $status['version']);
 		$output->writeln('State: ' . $status['state']);
 		$output->writeln('Provisioned: ' . ($status['provisioned'] ? 'yes' : 'no'));
+		if (isset($status['last_error'], $status['last_error_stage'])) {
+			$output->writeln('Last error: ' . $status['last_error']);
+			$output->writeln('Last error stage: ' . $status['last_error_stage']);
+		}
 		$output->writeln('FreePBX support: ' . implode(' and ', $status['freepbx_support']));
 
 		return 0;

@@ -26,6 +26,10 @@ class ActivationContractDialplan {
 	}
 }
 
+class ActivationContractSilentDialplan extends ActivationContractDialplan {
+	public function add($context, $extension, $label, $command): void {}
+}
+
 class ActivationContractApplication {
 	protected $data;
 	public function __construct($data = '') { $this->data = $data; }
@@ -53,8 +57,12 @@ class ActivationContractCoreApi {
 	public $failDID = false;
 	public $corruptDID = false;
 	public $editCalls = 0;
+	public $didException = null;
 
-	public function getAllDIDs(): array { return $this->dids; }
+	public function getAllDIDs(): array {
+		if ($this->didException !== null) { throw $this->didException; }
+		return $this->dids;
+	}
 	public function addDID(array $settings): bool {
 		if ($this->failDID) { return false; }
 		$this->didAddCalls++;
@@ -205,6 +213,9 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 	private $firewall;
 	public $activationHostWasLocalBeforeRequest = false;
 	public $reloadRequests = 0;
+	public $remoteException = null;
+	public $reloadException = null;
+	public $failDialplanVerification = false;
 
 	public function __construct(string $directory, array $responses, $core = null, $routing = null, $firewall = null) {
 		parent::__construct(new stdClass());
@@ -216,7 +227,9 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 		FreePBX::$module = $this;
 	}
 
-	protected function dialplanBuilder() { return new ActivationContractDialplan(); }
+	protected function dialplanBuilder() {
+		return $this->failDialplanVerification ? new ActivationContractSilentDialplan() : new ActivationContractDialplan();
+	}
 
 	protected function storageDirectory(): string {
 		return $this->directory;
@@ -240,6 +253,7 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 
 	protected function requestConfigurationReload(): void {
 		$this->reloadRequests++;
+		if ($this->reloadException !== null) { throw $this->reloadException; }
 	}
 
 	protected function supportsSodium(): bool {
@@ -275,6 +289,7 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 
 	protected function sendActivationRequest(string $request): string {
 		$this->requests[] = $request;
+		if ($this->remoteException !== null) { throw $this->remoteException; }
 		$this->activationHostWasLocalBeforeRequest = isset($this->firewall->networkMaps['my-connect.freepbxhosting.uk']) && $this->firewall->networkMaps['my-connect.freepbxhosting.uk'] === 'internal';
 		return (string)array_shift($this->responses);
 	}
@@ -501,6 +516,7 @@ $disabledModule = new ActivationContractModule($directory, [activation_fixture_r
 $disabledResult = $disabledModule->activate('synthetic-test-token');
 $disabledState = json_decode((string)file_get_contents($directory . '/state.json'), true);
 activation_assert($disabledResult['success'] === false && $disabledState['provisioned'] === false, 'a disabled managed trunk must not verify as healthy');
+activation_assert($disabledResult['message'] === 'The module-owned trunk conflicts with the authorized configuration.' && $disabledResult['stage'] === 'local', 'managed-trunk conflict must return its exact safe local diagnostic');
 activation_assert($disabledModule->routingFixture()->addCalls === 0, 'a disabled managed trunk must prevent route creation');
 activation_cleanup($directory);
 
@@ -686,5 +702,64 @@ activation_assert($legacyModule->activate('synthetic-test-token')['success'], 'l
 activation_assert($legacyCore->editCalls === 1 && $legacyCore->getTrunkDetails($legacyId)['authentication'] === 'off', 'normalization must retain the same managed trunk ID and select Authentication None');
 activation_assert($legacyCore->getTrunkDetails($legacyId)['registration'] === 'none', 'normalization must retain Registration None');
 activation_cleanup($directory);
+
+$sensitiveExceptionText = 'synthetic-test-token synthetic-signature synthetic-secret /synthetic-private-path raw-synthetic-response #0 synthetic trace';
+$directory = activation_temp_directory();
+$dialplanErrorModule = new ActivationContractModule($directory, [activation_fixture_response()]);
+$dialplanErrorModule->failDialplanVerification = true;
+$dialplanErrorResult = $dialplanErrorModule->activate('synthetic-test-token');
+activation_assert($dialplanErrorResult === ['success' => false, 'message' => 'Test answering dialplan failed verification.', 'stage' => 'local'], 'test answering verification must return its exact safe diagnostic');
+activation_assert($dialplanErrorModule->getStatus()['last_error'] === $dialplanErrorResult['message'], 'test answering failure should remain inspectable in persisted status');
+$dialplanErrorModule->failDialplanVerification = false;
+activation_assert($dialplanErrorModule->activate('synthetic-test-token')['success'] && count($dialplanErrorModule->requests()) === 1, 'test answering failure should retry locally');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$remoteErrorModule = new ActivationContractModule($directory, []);
+$remoteErrorModule->remoteException = new RuntimeException($sensitiveExceptionText);
+$remoteErrorResult = $remoteErrorModule->activate('synthetic-test-token');
+activation_assert($remoteErrorResult === ['success' => false, 'message' => 'Unable to complete activation with the DOMAINTAINS service.', 'stage' => 'remote'], 'remote errors must remain generic and structured');
+activation_assert(!file_exists($directory . '/state.json'), 'remote failure must not persist raw response or exception detail');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$diagnosticCore = new ActivationContractCoreApi();
+$diagnosticCore->dids[] = ['extension' => '447700900123', 'cidnum' => '', 'destination' => 'unrelated,s,1', 'description' => 'Administrator Route'];
+$diagnosticModule = new ActivationContractModule($directory, [activation_fixture_response()], $diagnosticCore);
+$diagnosticModule->reloadException = new RuntimeException($sensitiveExceptionText);
+$diagnosticResult = $diagnosticModule->activate('synthetic-test-token');
+$expectedLocalError = 'An existing DID route conflicts with the authorized inbound route.';
+activation_assert($diagnosticResult === ['success' => false, 'message' => $expectedLocalError, 'stage' => 'local'], 'local conflict must retain its exact safe message even when the follow-up reload request fails');
+$diagnosticState = json_decode(file_get_contents($directory . '/state.json'), true);
+activation_assert($diagnosticState['provisioned'] === false && $diagnosticState['last_error'] === $expectedLocalError && $diagnosticState['last_error_stage'] === 'local', 'persist safe error and local stage while retaining pending authorization');
+$diagnosticStatus = $diagnosticModule->getStatus();
+activation_assert($diagnosticStatus['last_error'] === $expectedLocalError && $diagnosticStatus['last_error_stage'] === 'local', 'status must expose the persisted safe diagnostic');
+$diagnosticCore->dids = [];
+$diagnosticModule->reloadException = null;
+activation_assert($diagnosticModule->activate('synthetic-test-token')['success'], 'local diagnostic failure should remain retryable');
+$recoveredState = json_decode(file_get_contents($directory . '/state.json'), true);
+activation_assert(!array_key_exists('last_error', $recoveredState) && !array_key_exists('last_error_stage', $recoveredState), 'successful retry must clear both stored error fields');
+$recoveredStatus = $diagnosticModule->getStatus();
+activation_assert(!array_key_exists('last_error', $recoveredStatus) && count($diagnosticModule->requests()) === 1, 'successful retry must clear status without another remote activation');
+activation_cleanup($directory);
+
+foreach ([new RuntimeException($sensitiveExceptionText), new LogicException('An existing DID route conflicts with the authorized inbound route.')] as $unsafeException) {
+	$directory = activation_temp_directory();
+	$unsafeCore = new ActivationContractCoreApi();
+	$unsafeCore->didException = $unsafeException;
+	$unsafeModule = new ActivationContractModule($directory, [activation_fixture_response()], $unsafeCore);
+	$unsafeResult = $unsafeModule->activate('synthetic-test-token');
+	activation_assert($unsafeResult === ['success' => false, 'message' => 'Local DOMAINTAINS reconciliation failed.', 'stage' => 'local'], 'unknown text and non-RuntimeException errors must not be surfaced');
+	$unsafeStatus = $unsafeModule->getStatus();
+	activation_assert($unsafeStatus['last_error'] === 'Local DOMAINTAINS reconciliation failed.', 'persistent status must expose only allowlisted messages');
+	foreach (['synthetic-test-token', 'synthetic-signature', 'synthetic-secret', '/synthetic-private-path', 'raw-synthetic-response', '#0', 'RuntimeException', 'LogicException'] as $sensitiveMarker) {
+		activation_assert(strpos(json_encode([$unsafeResult, $unsafeStatus]), $sensitiveMarker) === false, 'diagnostics must not contain ' . $sensitiveMarker);
+	}
+	$unsafeState = json_decode(file_get_contents($directory . '/state.json'), true);
+	$unsafeState['last_error'] = $sensitiveExceptionText;
+	file_put_contents($directory . '/state.json', json_encode($unsafeState));
+	activation_assert($unsafeModule->getStatus()['last_error'] === 'Local DOMAINTAINS reconciliation failed.', 'status must sanitize a non-allowlisted persisted error');
+	activation_cleanup($directory);
+}
 
 echo "Activation contract passed.\n";

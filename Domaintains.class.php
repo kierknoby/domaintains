@@ -13,7 +13,7 @@ namespace FreePBX\modules;
 class Domaintains implements \BMO {
 
 	/** Fallback only. Authoritative version lives in module.xml. */
-	const VERSION = '0.3.0';
+	const VERSION = '0.3.1-dev';
 	const ACTIVATION_ENDPOINT = 'https://my-connect.freepbxhosting.uk/activate';
 	const TRUNK_NAME = 'DOMAINTAINS';
 	const ROUTE_NAME = 'DOMAINTAINS-Outbound';
@@ -102,6 +102,10 @@ class Domaintains implements \BMO {
 			$status['inbound_trunks'] = count(array_filter($record->trunks, function ($trunk) { return $trunk->role === 'inbound'; }));
 			$status['outbound_trunks'] = count(array_filter($record->trunks, function ($trunk) { return $trunk->role === 'outbound'; }));
 			$status['test_destination'] = $provisioned ? 'ready' : 'pending';
+			if (isset($record->last_error, $record->last_error_stage) && $record->last_error_stage === 'local') {
+				$status['last_error'] = $this->safeLocalErrorMessage(is_string($record->last_error) ? $record->last_error : '');
+				$status['last_error_stage'] = 'local';
+			}
 		}
 		return $status;
 	}
@@ -109,12 +113,14 @@ class Domaintains implements \BMO {
 	/** Activate this installation using the provider-issued key. */
 	public function activate(string $activationKey): array {
 		if (trim($activationKey) === '') {
-			return ['success' => false, 'message' => _('Enter an activation key.')];
+			return ['success' => false, 'message' => _('Enter an activation key.'), 'stage' => 'remote'];
 		}
 		if (!$this->supportsSodium()) {
-			return ['success' => false, 'message' => _('Activation is unavailable because sodium support is missing.')];
+			return ['success' => false, 'message' => _('Activation is unavailable because sodium support is missing.'), 'stage' => 'remote'];
 		}
 		$lock = null;
+		$stage = 'remote';
+		$state = null;
 		$configurationChanged = false;
 		$reloadRequested = false;
 		try {
@@ -135,19 +141,28 @@ class Domaintains implements \BMO {
 			}
 
 			$existingState = $this->readActivationState();
+			if ($existingState !== null) {
+				$stage = 'local';
+				$state = array_merge($this->authorizedValues($existingState), [
+					'provisioned' => $existingState->provisioned,
+					'activated_at' => $existingState->activated_at,
+					'public_key_fingerprint' => $existingState->public_key_fingerprint,
+					'activation_key_fingerprint' => $existingState->activation_key_fingerprint,
+				]);
+			}
 			$this->ensureActivationHostInLocalZone();
 			if ($existingState === null && !$this->supportsHttpsTransport()) {
-				return ['success' => false, 'message' => _('Activation is unavailable because HTTPS support is missing.')];
+				return ['success' => false, 'message' => _('Activation is unavailable because HTTPS support is missing.'), 'stage' => 'remote'];
 			}
 			list($publicKey, $secretKey) = $this->loadOrCreateSigningKeypair($existingState === null);
 			$publicKeyFingerprint = hash('sha256', $publicKey);
 			$activationKeyFingerprint = $this->activationKeyFingerprint($activationKey, $secretKey);
 			if ($existingState !== null) {
 				if (!hash_equals($existingState->public_key_fingerprint, $publicKeyFingerprint)) {
-					return ['success' => false, 'message' => _('The local signing identity does not match the pending activation state.')];
+					return ['success' => false, 'message' => _('The local signing identity does not match the pending activation state.'), 'stage' => 'local'];
 				}
 				if (!hash_equals($existingState->activation_key_fingerprint, $activationKeyFingerprint)) {
-					return ['success' => false, 'message' => _('This installation is already linked to a different activation identity.')];
+					return ['success' => false, 'message' => _('This installation is already linked to a different activation identity.'), 'stage' => 'local'];
 				}
 				$this->clearSigningSecret($secretKey);
 				$responseValues = $this->authorizedValues($existingState);
@@ -196,6 +211,7 @@ class Domaintains implements \BMO {
 					'activation_key_fingerprint' => $activationKeyFingerprint,
 				]);
 				$this->writeActivationState($state);
+				$stage = 'local';
 			}
 
 			try {
@@ -209,17 +225,34 @@ class Domaintains implements \BMO {
 					$reloadRequested = true;
 				}
 				$this->verifyLocalConfiguration($state);
+				unset($state['last_error'], $state['last_error_stage']);
 				$state['provisioned'] = true;
 				$this->writeActivationState($state);
 			} catch (\Throwable $e) {
 				if ($configurationChanged && !$reloadRequested) {
-					$this->requestConfigurationReload();
+					try {
+						$this->requestConfigurationReload();
+					} catch (\Throwable $reloadError) {
+					}
 				}
 				throw $e;
 			}
 			return ['success' => true, 'message' => _('DOMAINTAINS activation and local configuration completed successfully.')];
 		} catch (\Throwable $e) {
-			return ['success' => false, 'message' => _('Activation failed. Check the service connection and try again.')];
+			$message = $stage === 'local'
+				? $this->safeLocalErrorMessage($e instanceof \RuntimeException ? $e->getMessage() : '')
+				: _('Unable to complete activation with the DOMAINTAINS service.');
+			if ($stage === 'local' && is_array($state)) {
+				$state['provisioned'] = false;
+				$state['last_error'] = $message;
+				$state['last_error_stage'] = 'local';
+				try {
+					$this->writeActivationState($state);
+				} catch (\Throwable $storageError) {
+					$message .= ' ' . _('The failure status could not be saved.');
+				}
+			}
+			return ['success' => false, 'message' => $message, 'stage' => $stage];
 		} finally {
 			if (isset($secretKey) && is_string($secretKey)) {
 				$this->clearSigningSecret($secretKey);
@@ -238,6 +271,56 @@ class Domaintains implements \BMO {
 			'activationCsrfToken' => $this->createSessionCsrfToken(),
 			'activationMessage' => $this->takeGuiMessage(),
 		]);
+	}
+
+	private function safeLocalErrorMessage(string $message): string {
+		$safeMessages = [
+			'Local DOMAINTAINS reconciliation failed.',
+			'An unexpected module-owned trunk conflicts with the authorized trunk set.',
+			'The module-owned trunk conflicts with the authorized configuration.',
+			'Multiple module-owned trunks were found.',
+			'Unable to list FreePBX trunks.',
+			'FreePBX PJSIP trunk API is unavailable.',
+			'Unable to create the module-owned PJSIP trunk.',
+			'The created PJSIP trunk did not verify.',
+			'Unable to start trunk normalization transaction.',
+			'Unable to normalize managed trunk authentication.',
+			'Normalized managed trunk failed verification.',
+			'Unable to derive a managed trunk name.',
+			'Invalid test destination registration.',
+			'Test destination hooks are unavailable.',
+			'Test answering dialplan failed verification.',
+			'Unable to inspect inbound routes.',
+			'An existing DID route conflicts with the authorized inbound route.',
+			'Unable to create an authorized inbound route.',
+			'An authorized inbound route failed verification.',
+			'Unable to list FreePBX outbound routes.',
+			'Multiple module-owned outbound routes were found.',
+			'A module-owned outbound route exists without an authorized outbound trunk.',
+			'The module-owned outbound route conflicts with the required policy.',
+			'FreePBX route transaction API is unavailable.',
+			'Unable to start outbound route transaction.',
+			'Unable to create the module-owned outbound route.',
+			'The created outbound route did not verify.',
+			'Unable to commit outbound route transaction.',
+			'The authorized service identity is invalid.',
+			'A local PJSIP trunk failed verification.',
+			'Unexpected module-owned outbound route without authorized outbound trunks.',
+			'The local outbound route failed verification.',
+			'FreePBX reload notification API is unavailable.',
+			'FreePBX Firewall zone API is unavailable.',
+			'Activation service hostname is assigned to a conflicting Firewall zone.',
+			'Activation service hostname did not verify in the Firewall local zone.',
+			'Unable to read FreePBX Firewall zones.',
+			'Unable to create secure file.',
+			'Unable to write secure file.',
+			'Unable to save secure file.',
+			'Unable to encode activation state.',
+			'Signing key is missing for retained activation state.',
+			'Invalid signing key file.',
+			'Unable to secure signing key file.',
+		];
+		return in_array($message, $safeMessages, true) ? $message : 'Local DOMAINTAINS reconciliation failed.';
 	}
 
 	protected function storageDirectory(): string {

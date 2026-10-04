@@ -23,6 +23,11 @@ scaffold_assert(strpos($page, '\\FreePBX::Domaintains()->showPage()') !== false,
 scaffold_assert(strpos($view, 'name="activation_key"') !== false, 'GUI should provide an activation key field');
 scaffold_assert(strpos($view, 'name="domaintains_csrf"') !== false, 'GUI activation should include CSRF protection');
 scaffold_assert(strpos($console, "->activate(\$key)") !== false, 'CLI should use the shared module activation method');
+scaffold_assert(strpos($console, " . \$result['message'] . ") !== false, 'CLI should print the returned safe activation message');
+scaffold_assert(strpos($console, 'OutputInterface::VERBOSITY_VERBOSE') !== false && strpos($console, 'Stage: local reconciliation') !== false, 'verbose CLI should expose only a safe stage indicator');
+scaffold_assert(strpos($module, "\$this->setGuiMessage(\$result['success'], \$result['message']);") !== false, 'GUI controller should forward the returned safe message unchanged');
+scaffold_assert(strpos($view, "htmlspecialchars((string)\$activationMessage['message'], ENT_QUOTES, 'UTF-8')") !== false, 'GUI should display and escape the returned activation message');
+scaffold_assert(strpos($view, "htmlspecialchars(\$status['last_error'], ENT_QUOTES, 'UTF-8')") !== false, 'GUI status should display the persisted safe error');
 scaffold_assert(strpos($console, "addArgument('activation-key'") === false, 'CLI must not accept an activation key as an argument');
 scaffold_assert(strpos($console, 'setHidden(true)') !== false && strpos($console, 'setHiddenFallback(false)') !== false, 'CLI must prompt with hidden input and fail if hidden input is unsupported');
 scaffold_assert(strpos($readme, "fwconsole domaintains activate\n") !== false, 'README should document activation without a key argument');
