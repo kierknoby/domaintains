@@ -2,6 +2,6 @@
 /**
  * DOMAINTAINS install hook.
  *
- * Version 0.2.0 creates local activation state on demand and has no schema or
- * scheduled jobs to install.
+ * Version 0.3.0 creates local activation and test destination state on demand.
+ * It has no schema migrations or scheduled jobs to install.
  */

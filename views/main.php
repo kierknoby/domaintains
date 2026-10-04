@@ -43,6 +43,15 @@ $activationMessage = isset($activationMessage) && is_array($activationMessage) ?
 								<th><?php echo _('Module version'); ?></th>
 								<td><?php echo htmlspecialchars($moduleVersion, ENT_QUOTES, 'UTF-8'); ?></td>
 							</tr>
+							<?php if (!empty($status['provisioned'])): ?>
+							<?php foreach (['inbound_numbers' => _('Inbound numbers'), 'inbound_trunks' => _('Inbound trunks'), 'outbound_trunks' => _('Outbound trunks')] as $field => $label): ?>
+							<tr>
+								<th><?php echo htmlspecialchars($label, ENT_QUOTES, 'UTF-8'); ?></th>
+								<td><?php echo (int)$status[$field]; ?></td>
+							</tr>
+							<?php endforeach; ?>
+							<tr><th><?php echo _('Test destination'); ?></th><td><?php echo _('Ready'); ?></td></tr>
+							<?php endif; ?>
 						</tbody>
 					</table>
 				</div>

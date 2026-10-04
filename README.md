@@ -1,4 +1,4 @@
-# DOMAINTAINS 0.2.0
+# DOMAINTAINS 0.3.0
 
 DOMAINTAINS is a FreePBX module for FreePBX 16 and 17.
 
@@ -17,8 +17,9 @@ the key in the command itself. Activation connects to the DOMAINTAINS
 activation service. The module creates a local signing identity and does not
 retain the activation key after successful activation.
 
-After authorization, the module reconciles and verifies its local SIP trunk and
-outbound route configuration. It requires PHP sodium and HTTPS support. Check
+After authorization, the module reconciles and verifies its local SIP trunks and
+routes. Assigned incoming numbers initially use **DOMAINTAINS Test**, which answers
+with confirmation tones and hangs up. It requires PHP sodium and HTTPS support. Check
 activation status with:
 
 ```sh

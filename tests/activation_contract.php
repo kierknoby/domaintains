@@ -13,6 +13,29 @@ if (!function_exists('_')) {
 
 require_once dirname(__DIR__) . '/Domaintains.class.php';
 
+class FreePBX {
+	public static $module;
+	public static function Domaintains() { return self::$module; }
+	public static function Modules() { throw new RuntimeException('Synthetic metadata unavailable.'); }
+}
+
+class ActivationContractDialplan {
+	public $_exts = [];
+	public function add($context, $extension, $label, $command): void {
+		$this->_exts[$context][' ' . $extension . ' '][] = ['cmd' => $command];
+	}
+}
+
+class ActivationContractApplication {
+	protected $data;
+	public function __construct($data = '') { $this->data = $data; }
+}
+class ext_answer extends ActivationContractApplication { public function output() { return 'Answer'; } }
+class ext_wait extends ActivationContractApplication { public function output() { return 'Wait(' . $this->data . ')'; } }
+class ext_playtones extends ActivationContractApplication { public function output() { return 'Playtones(' . $this->data . ')'; } }
+class ext_stopplaytones extends ActivationContractApplication { public function output() { return 'StopPlaytones'; } }
+class ext_hangup extends ActivationContractApplication { public function output() { return 'Hangup(' . $this->data . ')'; } }
+
 function activation_assert(bool $condition, string $message): void {
 	if (!$condition) {
 		throw new RuntimeException($message);
@@ -25,6 +48,25 @@ class ActivationContractCoreApi {
 	public $addCalls = 0;
 	public $lastTrunkSettings = [];
 	public $postWasIsolated = false;
+	public $dids = [];
+	public $didAddCalls = 0;
+	public $failDID = false;
+	public $corruptDID = false;
+	public $editCalls = 0;
+
+	public function getAllDIDs(): array { return $this->dids; }
+	public function addDID(array $settings): bool {
+		if ($this->failDID) { return false; }
+		$this->didAddCalls++;
+		if ($this->corruptDID) { $settings['destination'] = 'unrelated,s,1'; }
+		$this->dids[] = $settings;
+		return true;
+	}
+	public function deleteTrunk($id, $technology, $edit): bool {
+		$this->trunks = array_values(array_filter($this->trunks, function ($trunk) use ($id) { return $trunk['trunkid'] !== $id; }));
+		unset($this->details[$id]);
+		return true;
+	}
 
 	public function listTrunks(): array {
 		return $this->trunks;
@@ -46,11 +88,11 @@ class ActivationContractCoreApi {
 		], $settings, isset($posts['imports']) ? $posts['imports'] : []);
 	}
 
-	public function addTrunk(string $name, string $technology, array $settings): string {
-		$this->addCalls++;
+	public function addTrunk(string $name, string $technology, array $settings, bool $edit = false): string {
+		if ($edit) { $this->editCalls++; } else { $this->addCalls++; }
 		$this->postWasIsolated = empty($_POST);
 		$this->lastTrunkSettings = $settings;
-		$trunkId = 'synthetic-trunk-' . $this->addCalls;
+		$trunkId = $edit ? $settings['trunknum'] : 'synthetic-trunk-' . $this->addCalls;
 		$this->trunks[] = ['trunkid' => $trunkId, 'name' => $name, 'tech' => $technology, 'disabled' => 'off'];
 		$this->details[$trunkId] = $settings;
 		return $trunkId;
@@ -66,7 +108,7 @@ class ActivationContractCoreApi {
 			'sip_server_port' => (string)$port,
 			'context' => 'from-pstn',
 			'sendrpid' => 'no',
-			'authentication' => 'none',
+			'authentication' => 'off',
 			'registration' => 'none',
 			'username' => '',
 			'auth_username' => '',
@@ -171,7 +213,10 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 		$this->core = $core === null ? new ActivationContractCoreApi() : $core;
 		$this->routing = $routing === null ? new ActivationContractRoutingApi() : $routing;
 		$this->firewall = $firewall === null ? new ActivationContractFirewallApi() : $firewall;
+		FreePBX::$module = $this;
 	}
+
+	protected function dialplanBuilder() { return new ActivationContractDialplan(); }
 
 	protected function storageDirectory(): string {
 		return $this->directory;
@@ -261,6 +306,7 @@ function activation_fixture_response(array $overrides = []): string {
 		'service' => 'my-12345678',
 		'profile' => 'test-profile',
 		'domaintains_hostname' => 'pbx.example.invalid',
+		'numbers' => ['447700900123', '447700900124'],
 		'trunks' => [
 			['role' => 'outbound', 'sip_host' => 'sip.example.invalid', 'sip_port' => 5060],
 		],
@@ -304,7 +350,7 @@ activation_assert($_POST === ['activation_key' => 'synthetic-test-token'], 'acti
 $_POST = $originalPost;
 activation_assert($result['success'] === true, 'ok=true with all required flat fields should activate');
 $stored = json_decode((string)file_get_contents($directory . '/state.json'), true);
-foreach (['service', 'trunks', 'profile', 'domaintains_hostname'] as $field) {
+foreach (['service', 'trunks', 'profile', 'domaintains_hostname', 'numbers'] as $field) {
 	activation_assert(array_key_exists($field, $stored), 'persisted state should include required field ' . $field);
 }
 activation_assert($stored['provisioned'] === true, 'fresh local provisioning should set provisioned only after verification');
@@ -317,7 +363,7 @@ activation_assert($module->firewallFixture()->addCalls === 1 && $module->activat
 $trunkRecord = $module->coreFixture()->trunks[0];
 $trunkSettings = $module->coreFixture()->getTrunkDetails($trunkRecord['trunkid']);
 activation_assert($trunkRecord['tech'] === 'pjsip', 'managed trunk should use PJSIP');
-activation_assert($trunkSettings['authentication'] === 'none' && $trunkSettings['registration'] === 'none', 'managed trunk must not authenticate or register');
+activation_assert($trunkSettings['authentication'] === 'off' && $trunkSettings['registration'] === 'none', 'managed trunk must render both FreePBX GUI None selections without authentication or registration');
 activation_assert($trunkSettings['sip_server'] === 'sip.example.invalid' && $trunkSettings['sip_server_port'] === '5060', 'managed trunk should use the authorized SIP server and port');
 activation_assert($trunkSettings['context'] === 'from-pstn' && $trunkSettings['sendrpid'] === 'no', 'managed trunk should apply the required context and sendrpid policy');
 $routeTrunks = array_values($module->routingFixture()->trunks);
@@ -367,6 +413,12 @@ activation_assert($multiTrunkResult['success'] === true, 'all authorized PBX-fac
 activation_assert(count($multiTrunkModule->coreFixture()->trunks) === 3, 'one managed PJSIP trunk should be created per authorized entry');
 activation_assert(count($multiTrunkRouteTrunks) === 2, 'only outbound-role trunks should participate in the outbound route');
 $allManagedTrunks = $multiTrunkModule->coreFixture()->trunks;
+foreach ($allManagedTrunks as $managedTrunk) {
+	$settings = $multiTrunkModule->coreFixture()->getTrunkDetails($managedTrunk['trunkid']);
+	activation_assert($settings['authentication'] === 'off' && $settings['registration'] === 'none', 'every inbound and outbound managed trunk must select None / None in the FreePBX GUI');
+	activation_assert($settings['auth_username'] === '' && $settings['username'] === '' && $settings['secret'] === '', 'every managed trunk must have blank authentication credentials');
+	activation_assert($settings['context'] === 'from-pstn' && $settings['sendrpid'] === 'no', 'every managed trunk must preserve the required context and sendrpid policy');
+}
 activation_assert($multiTrunkRouteTrunks === [$allManagedTrunks[0]['trunkid'], $allManagedTrunks[2]['trunkid']], 'outbound route must include both outbound-role trunks in authorized order and exclude inbound trunks');
 activation_cleanup($directory);
 
@@ -438,7 +490,7 @@ $conflictingResult = $conflictingModule->activate('synthetic-test-token');
 $conflictingState = json_decode((string)file_get_contents($directory . '/state.json'), true);
 activation_assert($conflictingResult['success'] === false, 'conflicting module-owned trunk must fail closed');
 activation_assert($conflictingState['provisioned'] === false, 'conflicting trunk must not mark the service provisioned');
-activation_assert($conflictingModule->routingFixture()->addCalls === 0 && $conflictingModule->reloadRequests === 0, 'a trunk conflict must not modify routes or request reload');
+activation_assert($conflictingModule->routingFixture()->addCalls === 0 && $conflictingModule->reloadRequests === 1, 'a trunk conflict must not modify routes; only the new test destination requests reload');
 activation_cleanup($directory);
 
 $directory = activation_temp_directory();
@@ -536,6 +588,103 @@ activation_assert($stateBeforeRetry === $stateAfterSameIdentity, 'same identity 
 activation_assert($differentIdentityResult['success'] === false, 'different service identity must be rejected');
 activation_assert($stateBeforeRetry === $stateAfterDifferentIdentity, 'different identity must not replace persisted state');
 activation_assert(count($identityModule->requests()) === 1, 'provisioned idempotency and identity rejection must not call the remote endpoint again');
+activation_cleanup($directory);
+
+foreach ([['447700900123', '447700900123'], [447700900123], [''], ['+447700900123'], ['44770090012a'], '447700900123'] as $invalidNumbers) {
+	list($result, $directory) = activation_attempt(activation_fixture_response(['numbers' => $invalidNumbers]));
+	activation_assert($result['success'] === false && !file_exists($directory . '/state.json'), 'invalid or duplicate authorized numbers must fail before local provisioning');
+	activation_cleanup($directory);
+}
+$missingNumbers = json_decode(activation_fixture_response(), true);
+unset($missingNumbers['numbers']);
+list($result, $directory) = activation_attempt(json_encode($missingNumbers));
+activation_assert($result['success'] === false, 'missing numbers must not be invented by the PBX');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$inboundCore = new ActivationContractCoreApi();
+$inboundModule = new ActivationContractModule($directory, [activation_fixture_response()], $inboundCore);
+activation_assert($inboundModule->activate('synthetic-test-token')['success'], 'authorized inbound routes should provision');
+activation_assert($inboundCore->didAddCalls === 2 && count($inboundCore->dids) === 2, 'create one exact inbound route per authorized number');
+foreach ($inboundCore->dids as $route) {
+	activation_assert(in_array($route['extension'], ['447700900123', '447700900124'], true), 'DID must be provider authorized');
+	activation_assert($route['destination'] === 'domaintains-test,s,1' && $route['cidnum'] === '', 'inbound routes must point to the local test destination, never a trunk');
+	activation_assert($route['description'] === 'DOMAINTAINS Inbound ' . $route['extension'], 'inbound descriptions must be deterministic');
+}
+$markerBefore = file_get_contents($directory . '/test-destination.json');
+activation_assert($inboundModule->testDestinationRegistered(), 'test destination should be registered before provisioning completes');
+$destinations = domaintains_destinations();
+activation_assert($destinations[0]['destination'] === 'domaintains-test,s,1' && $destinations[0]['description'] === 'DOMAINTAINS Test', 'FreePBX destination hook should expose the module-owned answering endpoint');
+activation_assert(domaintains_getdestinfo('domaintains-test,s,1')['description'] === 'DOMAINTAINS Test', 'FreePBX destination metadata should resolve');
+foreach (['16', '17'] as $freepbxVersion) {
+	$ext = new ActivationContractDialplan();
+	domaintains_get_config('asterisk');
+	$steps = array_map(function ($step) { return $step['cmd']->output(); }, $ext->_exts['domaintains-test'][' s ']);
+	activation_assert($steps === ['Answer', 'Wait(1)', 'Playtones(1000/200,0/200,1000/200,0/200,1000/400)', 'Wait(2)', 'StopPlaytones', 'Hangup()'], 'FreePBX ' . $freepbxVersion . ' hook should contribute deterministic answering tones and clean hangup');
+	$guiSettings = $inboundCore->lastTrunkSettings;
+	activation_assert($guiSettings['authentication'] === 'off' && $guiSettings['registration'] === 'none', 'FreePBX ' . $freepbxVersion . ' None radio predicates must both select');
+	activation_assert($guiSettings['username'] === '' && $guiSettings['auth_username'] === '' && $guiSettings['secret'] === '', 'GUI-normalized settings must contain no credentials');
+}
+activation_assert($inboundModule->activate('synthetic-test-token')['success'], 'repeat inbound provisioning should succeed');
+activation_assert($inboundCore->didAddCalls === 2 && $inboundModule->reloadRequests === 1, 'inbound routes and test destination should be idempotent without another reload');
+activation_assert(file_get_contents($directory . '/test-destination.json') === $markerBefore && count($inboundModule->requests()) === 1, 'test registration and remote activation should not repeat');
+$localStatus = $inboundModule->getStatus();
+activation_assert($localStatus['inbound_numbers'] === 2 && $localStatus['test_destination'] === 'ready', 'read-only status should expose local counts and readiness');
+file_put_contents($directory . '/test-destination.json', '{"version":2}');
+activation_assert(!$inboundModule->activate('synthetic-test-token')['success'], 'a corrupt test destination must fail closed even on a previously provisioned installation');
+activation_assert(json_decode(file_get_contents($directory . '/state.json'), true)['provisioned'] === false, 'failed full re-verification must return persisted state to pending');
+file_put_contents($directory . '/test-destination.json', '{"version":1}');
+activation_assert($inboundModule->activate('synthetic-test-token')['success'] && count($inboundModule->requests()) === 1, 'repaired destination registration should resume locally without reactivation');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$existingDIDCore = new ActivationContractCoreApi();
+$existingDIDCore->dids[] = ['extension' => '447700900123', 'cidnum' => '', 'destination' => 'domaintains-test,s,1', 'description' => 'DOMAINTAINS Inbound 447700900123'];
+$existingDIDCore->dids[] = ['extension' => '447700900199', 'cidnum' => '', 'destination' => 'unrelated,s,1', 'description' => 'Administrator Route'];
+$unrelatedBefore = $existingDIDCore->dids[1];
+$existingDIDModule = new ActivationContractModule($directory, [activation_fixture_response()], $existingDIDCore);
+activation_assert($existingDIDModule->activate('synthetic-test-token')['success'] && $existingDIDCore->didAddCalls === 1, 'an existing correct inbound route must be reused');
+activation_assert($existingDIDCore->dids[1] === $unrelatedBefore, 'unrelated administrator inbound route must not be modified');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$conflictDIDCore = new ActivationContractCoreApi();
+$conflictDIDCore->dids[] = ['extension' => '447700900123', 'cidnum' => '', 'destination' => 'unrelated,s,1', 'description' => 'Administrator Route'];
+$conflictBefore = $conflictDIDCore->dids;
+$conflictDIDModule = new ActivationContractModule($directory, [activation_fixture_response()], $conflictDIDCore);
+activation_assert(!$conflictDIDModule->activate('synthetic-test-token')['success'], 'an unrelated destination for an authorized DID must fail closed');
+$pendingDIDState = json_decode(file_get_contents($directory . '/state.json'), true);
+activation_assert($pendingDIDState['provisioned'] === false && $conflictDIDCore->dids === $conflictBefore, 'DID conflict must leave pending state and administrator routing unchanged');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$retryDIDCore = new ActivationContractCoreApi();
+$retryDIDCore->failDID = true;
+$retryDIDModule = new ActivationContractModule($directory, [activation_fixture_response()], $retryDIDCore);
+activation_assert(!$retryDIDModule->activate('synthetic-test-token')['success'], 'inbound creation failure must not claim full provisioning');
+activation_assert(json_decode(file_get_contents($directory . '/state.json'), true)['provisioned'] === false, 'all stages must verify before provisioned=true');
+$retryDIDKey = file_get_contents($directory . '/signing.key');
+$retryDIDCore->failDID = false;
+activation_assert($retryDIDModule->activate('synthetic-test-token')['success'], 'inbound failure must be locally retryable');
+activation_assert(count($retryDIDModule->requests()) === 1 && file_get_contents($directory . '/signing.key') === $retryDIDKey, 'inbound retry must retain key and not recontact activation service');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$badDIDCore = new ActivationContractCoreApi();
+$badDIDCore->corruptDID = true;
+$badDIDModule = new ActivationContractModule($directory, [activation_fixture_response()], $badDIDCore);
+activation_assert(!$badDIDModule->activate('synthetic-test-token')['success'], 'incorrect API-created inbound destination must fail verification');
+activation_assert(json_decode(file_get_contents($directory . '/state.json'), true)['provisioned'] === false, 'failed inbound verification must retain pending state');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$legacyCore = new ActivationContractCoreApi();
+$legacyCore->seedManagedTrunk('sip.example.invalid', 5060, ['authentication' => 'none']);
+$legacyId = $legacyCore->trunks[0]['trunkid'];
+$legacyModule = new ActivationContractModule($directory, [activation_fixture_response()], $legacyCore);
+activation_assert($legacyModule->activate('synthetic-test-token')['success'], 'legacy managed None authentication should normalize to the GUI off value');
+activation_assert($legacyCore->editCalls === 1 && $legacyCore->getTrunkDetails($legacyId)['authentication'] === 'off', 'normalization must retain the same managed trunk ID and select Authentication None');
+activation_assert($legacyCore->getTrunkDetails($legacyId)['registration'] === 'none', 'normalization must retain Registration None');
 activation_cleanup($directory);
 
 echo "Activation contract passed.\n";

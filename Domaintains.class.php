@@ -13,10 +13,11 @@ namespace FreePBX\modules;
 class Domaintains implements \BMO {
 
 	/** Fallback only. Authoritative version lives in module.xml. */
-	const VERSION = '0.2.0';
+	const VERSION = '0.3.0';
 	const ACTIVATION_ENDPOINT = 'https://my-connect.freepbxhosting.uk/activate';
 	const TRUNK_NAME = 'DOMAINTAINS';
 	const ROUTE_NAME = 'DOMAINTAINS-Outbound';
+	const TEST_DESTINATION = 'domaintains-test,s,1';
 
 	/** @var \FreePBX */
 	private $FreePBX;
@@ -95,6 +96,12 @@ class Domaintains implements \BMO {
 		];
 		if ($activatedAt !== null) {
 			$status['activated_at'] = $activatedAt;
+		}
+		if (isset($record) && $record !== null && $state !== 'error') {
+			$status['inbound_numbers'] = count($record->numbers);
+			$status['inbound_trunks'] = count(array_filter($record->trunks, function ($trunk) { return $trunk->role === 'inbound'; }));
+			$status['outbound_trunks'] = count(array_filter($record->trunks, function ($trunk) { return $trunk->role === 'outbound'; }));
+			$status['test_destination'] = $provisioned ? 'ready' : 'pending';
 		}
 		return $status;
 	}
@@ -192,6 +199,10 @@ class Domaintains implements \BMO {
 			}
 
 			try {
+				if ($state['provisioned']) {
+					$state['provisioned'] = false;
+					$this->writeActivationState($state);
+				}
 				$this->reconcileLocalConfiguration($state, $configurationChanged);
 				if ($configurationChanged) {
 					$this->requestConfigurationReload();
@@ -334,7 +345,7 @@ class Domaintains implements \BMO {
 		if (is_object($data)) {
 			$data = (array)$data;
 		}
-		$fields = ['service', 'profile', 'domaintains_hostname', 'trunks'];
+		$fields = ['service', 'profile', 'domaintains_hostname', 'trunks', 'numbers'];
 		$values = [];
 		foreach ($fields as $field) {
 			if (!array_key_exists($field, $data)) {
@@ -351,6 +362,16 @@ class Domaintains implements \BMO {
 			throw new \RuntimeException('Activation state has an invalid service or trunk list.');
 		}
 		$values['trunks'] = $this->validateAuthorizedTrunks($values['trunks']);
+		if (!is_array($values['numbers']) || array_values($values['numbers']) !== $values['numbers']) {
+			throw new \RuntimeException('Authorized numbers must be a list.');
+		}
+		$seenNumbers = [];
+		foreach ($values['numbers'] as $number) {
+			if (!is_string($number) || !preg_match('/^[0-9]+$/D', $number) || isset($seenNumbers[$number])) {
+				throw new \RuntimeException('Invalid or duplicate authorized number.');
+			}
+			$seenNumbers[$number] = true;
+		}
 		return $values;
 	}
 
@@ -441,6 +462,7 @@ class Domaintains implements \BMO {
 	}
 
 	private function reconcileLocalConfiguration(array $state, &$configurationChanged): void {
+		$this->reconcileTestDestination($configurationChanged);
 		$this->assertNoUnexpectedManagedTrunks($state['trunks']);
 		$outboundTrunkIds = [];
 		foreach ($state['trunks'] as $authorizedTrunk) {
@@ -456,6 +478,7 @@ class Domaintains implements \BMO {
 		if ($routeChanged) {
 			$configurationChanged = true;
 		}
+		$this->reconcileInboundRoutes($state['numbers'], $configurationChanged);
 	}
 
 	private function assertNoUnexpectedManagedTrunks(array $authorizedTrunks): void {
@@ -470,6 +493,114 @@ class Domaintains implements \BMO {
 		foreach ($trunks as $trunk) {
 			if (isset($trunk['name']) && strpos($trunk['name'], self::TRUNK_NAME) === 0 && !isset($expectedNames[$trunk['name']])) {
 				throw new \RuntimeException('An unexpected module-owned trunk conflicts with the authorized trunk set.');
+			}
+		}
+	}
+
+	public function testDestinationRegistered(): bool {
+		$path = $this->storageDirectory() . '/test-destination.json';
+		if (!file_exists($path) && !is_link($path)) {
+			return false;
+		}
+		if (is_link($path) || !is_file($path) || !is_readable($path)) {
+			throw new \RuntimeException('Invalid test destination registration.');
+		}
+		$registration = json_decode((string)file_get_contents($path), true);
+		if ($registration !== ['version' => 1]) {
+			throw new \RuntimeException('Invalid test destination registration.');
+		}
+		return true;
+	}
+
+	private function reconcileTestDestination(&$configurationChanged): void {
+		require_once __DIR__ . '/functions.inc.php';
+		if (!$this->testDestinationRegistered()) {
+			$this->writeSecureFile($this->storageDirectory() . '/test-destination.json', "{\"version\":1}\n");
+			$configurationChanged = true;
+		}
+		$this->verifyTestDestination();
+	}
+
+	protected function dialplanBuilder() {
+		if (!class_exists('extensions')) {
+			$webRoot = $this->FreePBX->Config->get('AMPWEBROOT');
+			require_once $webRoot . '/admin/libraries/extensions.class.php';
+		}
+		return new \extensions();
+	}
+
+	public function contributeTestDialplan($builder): void {
+		if (!$this->testDestinationRegistered()) {
+			return;
+		}
+		$builder->add('domaintains-test', 's', '', new \ext_answer(''));
+		$builder->add('domaintains-test', 's', '', new \ext_wait('1'));
+		$builder->add('domaintains-test', 's', '', new \ext_playtones('1000/200,0/200,1000/200,0/200,1000/400'));
+		$builder->add('domaintains-test', 's', '', new \ext_wait('2'));
+		$builder->add('domaintains-test', 's', '', new \ext_stopplaytones(''));
+		$builder->add('domaintains-test', 's', '', new \ext_hangup(''));
+	}
+
+	private function verifyTestDestination(): void {
+		if (!$this->testDestinationRegistered() || !function_exists('domaintains_get_config') || !function_exists('domaintains_destinations')) {
+			throw new \RuntimeException('Test destination hooks are unavailable.');
+		}
+		$builder = $this->dialplanBuilder();
+		$this->contributeTestDialplan($builder);
+		$steps = isset($builder->_exts['domaintains-test'][' s ']) ? $builder->_exts['domaintains-test'][' s '] : [];
+		$output = [];
+		foreach ($steps as $step) {
+			$output[] = $step['cmd']->output();
+		}
+		if ($output !== ['Answer', 'Wait(1)', 'Playtones(1000/200,0/200,1000/200,0/200,1000/400)', 'Wait(2)', 'StopPlaytones', 'Hangup()']) {
+			throw new \RuntimeException('Test answering dialplan failed verification.');
+		}
+	}
+
+	private function inboundRouteMatches(array $route, string $number): bool {
+		return isset($route['extension'], $route['cidnum'], $route['destination'], $route['description'])
+			&& (string)$route['extension'] === $number && (string)$route['cidnum'] === ''
+			&& $route['destination'] === self::TEST_DESTINATION
+			&& $route['description'] === 'DOMAINTAINS Inbound ' . $number;
+	}
+
+	private function matchingInboundRoutes(string $number): array {
+		$routes = $this->coreApi()->getAllDIDs();
+		if (!is_array($routes)) {
+			throw new \RuntimeException('Unable to inspect inbound routes.');
+		}
+		return array_values(array_filter($routes, function ($route) use ($number) {
+			return isset($route['extension']) && (string)$route['extension'] === $number;
+		}));
+	}
+
+	private function reconcileInboundRoutes(array $numbers, &$configurationChanged): void {
+		foreach ($numbers as $number) {
+			$matches = $this->matchingInboundRoutes($number);
+			if (count($matches) > 0) {
+				if (count($matches) !== 1 || !$this->inboundRouteMatches($matches[0], $number)) {
+					throw new \RuntimeException('An existing DID route conflicts with the authorized inbound route.');
+				}
+				continue;
+			}
+			if (!$this->coreApi()->addDID([
+				'extension' => $number,
+				'cidnum' => '',
+				'description' => 'DOMAINTAINS Inbound ' . $number,
+				'destination' => self::TEST_DESTINATION,
+			])) {
+				throw new \RuntimeException('Unable to create an authorized inbound route.');
+			}
+			$configurationChanged = true;
+			$this->verifyInboundRoutes([$number]);
+		}
+	}
+
+	private function verifyInboundRoutes(array $numbers): void {
+		foreach ($numbers as $number) {
+			$matches = $this->matchingInboundRoutes($number);
+			if (count($matches) !== 1 || !$this->inboundRouteMatches($matches[0], $number)) {
+				throw new \RuntimeException('An authorized inbound route failed verification.');
 			}
 		}
 	}
@@ -490,6 +621,14 @@ class Domaintains implements \BMO {
 		if (count($matches) === 1) {
 			$trunk = $matches[0];
 			$id = isset($trunk['trunkid']) ? $trunk['trunkid'] : null;
+			if ($id !== null && $this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk, true)) {
+				$details = $core->getTrunkDetails($id);
+				if ($details['authentication'] === 'none') {
+					$this->normalizeManagedTrunkAuthentication($id, $trunk, $details, $authorizedTrunk);
+					$configurationChanged = true;
+					$trunk = $this->findManagedTrunk($core, $authorizedTrunk);
+				}
+			}
 			if ($id === null || !$this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk)) {
 				throw new \RuntimeException('The module-owned trunk conflicts with the authorized configuration.');
 			}
@@ -534,6 +673,38 @@ class Domaintains implements \BMO {
 		return count($matches) === 1 ? $matches[0] : null;
 	}
 
+	private function normalizeManagedTrunkAuthentication($id, array $trunk, array $details, array $authorizedTrunk): void {
+		$core = $this->coreApi();
+		$settings = array_merge($this->desiredTrunkSettings($authorizedTrunk), $trunk, $details, [
+			'authentication' => 'off',
+			'trunknum' => $id,
+			'disabletrunk' => $trunk['disabled'],
+			'failtrunk' => isset($trunk['failscript']) ? $trunk['failscript'] : '',
+		]);
+		$database = $this->databaseApi();
+		if (!$database->beginTransaction()) {
+			throw new \RuntimeException('Unable to start trunk normalization transaction.');
+		}
+		$originalPost = $_POST;
+		$_POST = [];
+		try {
+			if ($core->deleteTrunk($id, 'pjsip', true) !== true || (string)$core->addTrunk($trunk['name'], 'pjsip', $settings, true) !== (string)$id) {
+				throw new \RuntimeException('Unable to normalize managed trunk authentication.');
+			}
+			$updated = $this->findManagedTrunk($core, $authorizedTrunk);
+			if ($updated === null || !$this->trunkMatchesAuthorizedState($id, $updated, $authorizedTrunk) || !$database->commit()) {
+				throw new \RuntimeException('Normalized managed trunk failed verification.');
+			}
+		} catch (\Throwable $e) {
+			if ($database->inTransaction()) {
+				$database->rollBack();
+			}
+			throw $e;
+		} finally {
+			$_POST = $originalPost;
+		}
+	}
+
 	private function managedTrunkName(array $authorizedTrunk): string {
 		$identity = json_encode([$authorizedTrunk['role'], $authorizedTrunk['sip_host'], $authorizedTrunk['sip_port']], JSON_UNESCAPED_SLASHES);
 		if ($identity === false) {
@@ -565,12 +736,15 @@ class Domaintains implements \BMO {
 			'sip_server_port' => (string)$authorizedTrunk['sip_port'],
 			'context' => 'from-pstn',
 			'sendrpid' => 'no',
-			'authentication' => 'none',
+			'authentication' => 'off',
 			'registration' => 'none',
+			'auth_username' => '',
+			'username' => '',
+			'secret' => '',
 		];
 	}
 
-	private function trunkMatchesAuthorizedState($trunkId, array $trunk, array $authorizedTrunk): bool {
+	private function trunkMatchesAuthorizedState($trunkId, array $trunk, array $authorizedTrunk, bool $allowLegacyAuthentication = false): bool {
 		if (!isset($trunk['tech'], $trunk['disabled']) || strtolower((string)$trunk['tech']) !== 'pjsip' || strtolower((string)$trunk['disabled']) !== 'off') {
 			return false;
 		}
@@ -581,6 +755,9 @@ class Domaintains implements \BMO {
 		}
 		$expected = $this->desiredTrunkSettings($authorizedTrunk);
 		foreach (['trunk_name', 'sip_server', 'context', 'sendrpid', 'authentication', 'registration'] as $field) {
+			if ($field === 'authentication' && $allowLegacyAuthentication && isset($details[$field]) && $details[$field] === 'none') {
+				continue;
+			}
 			if (!isset($details[$field]) || (string)$details[$field] !== (string)$expected[$field]) {
 				return false;
 			}
@@ -737,11 +914,11 @@ class Domaintains implements \BMO {
 			if ($route !== null) {
 				throw new \RuntimeException('Unexpected module-owned outbound route without authorized outbound trunks.');
 			}
-			return;
-		}
-		if ($route === null || !$this->routeMatchesPolicy($routing, $route, $this->outboundRoutePatterns($state['service']), $outboundTrunkIds)) {
+		} elseif ($route === null || !$this->routeMatchesPolicy($routing, $route, $this->outboundRoutePatterns($state['service']), $outboundTrunkIds)) {
 			throw new \RuntimeException('The local outbound route failed verification.');
 		}
+		$this->verifyInboundRoutes($state['numbers']);
+		$this->verifyTestDestination();
 	}
 
 	protected function requestConfigurationReload(): void {
