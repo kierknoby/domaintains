@@ -21,7 +21,7 @@ $xml = file_get_contents($root . '/module.xml');
 compatibility_assert($xml !== false && $xml !== '', 'module.xml should be readable');
 compatibility_assert(xml_first($xml, 'rawname') === 'domaintains', 'raw module name should be domaintains');
 compatibility_assert(xml_first($xml, 'name') === 'DOMAINTAINS', 'display name should be DOMAINTAINS');
-compatibility_assert(xml_first($xml, 'version') === '0.3.1-dev', 'module version should be 0.3.1-dev');
+compatibility_assert(xml_first($xml, 'version') === '0.3.2-dev', 'module version should be 0.3.2-dev');
 compatibility_assert(xml_first($xml, 'publisher') === 'FreePBX UK', 'publisher should be FreePBX UK');
 compatibility_assert(xml_first($xml, 'license') === 'GPLv3+', 'module licence metadata should be GPLv3+');
 

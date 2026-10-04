@@ -13,7 +13,7 @@ namespace FreePBX\modules;
 class Domaintains implements \BMO {
 
 	/** Fallback only. Authoritative version lives in module.xml. */
-	const VERSION = '0.3.1-dev';
+	const VERSION = '0.3.2-dev';
 	const ACTIVATION_ENDPOINT = 'https://my-connect.freepbxhosting.uk/activate';
 	const TRUNK_NAME = 'DOMAINTAINS';
 	const ROUTE_NAME = 'DOMAINTAINS-Outbound';
@@ -21,6 +21,7 @@ class Domaintains implements \BMO {
 
 	/** @var \FreePBX */
 	private $FreePBX;
+	private $managedTrunkNames = [];
 
 	public function __construct($freepbx = null) {
 		if ($freepbx === null) {
@@ -319,6 +320,10 @@ class Domaintains implements \BMO {
 			'Signing key is missing for retained activation state.',
 			'Invalid signing key file.',
 			'Unable to secure signing key file.',
+			'Ambiguous managed trunk upgrade mapping.',
+			'Unexpected managed trunk role or identity.',
+			'Unable to reconcile managed trunk in place.',
+			'Reconciled managed trunk failed verification.',
 		];
 		return in_array($message, $safeMessages, true) ? $message : 'Local DOMAINTAINS reconciliation failed.';
 	}
@@ -565,18 +570,41 @@ class Domaintains implements \BMO {
 	}
 
 	private function assertNoUnexpectedManagedTrunks(array $authorizedTrunks): void {
-		$expectedNames = [];
+		$this->managedTrunkNames = [];
+		$targets = [];
+		$roles = [];
 		foreach ($authorizedTrunks as $authorizedTrunk) {
-			$expectedNames[$this->managedTrunkName($authorizedTrunk)] = true;
+			$key = $this->managedTrunkName($authorizedTrunk);
+			if (isset($targets[$key])) {
+				throw new \RuntimeException('Ambiguous managed trunk upgrade mapping.');
+			}
+			$targets[$key] = $authorizedTrunk;
+			$roles[$authorizedTrunk['role']][] = $key;
 		}
 		$trunks = $this->coreApi()->listTrunks();
 		if (!is_array($trunks)) {
 			throw new \RuntimeException('Unable to list FreePBX trunks.');
 		}
 		foreach ($trunks as $trunk) {
-			if (isset($trunk['name']) && strpos($trunk['name'], self::TRUNK_NAME) === 0 && !isset($expectedNames[$trunk['name']])) {
-				throw new \RuntimeException('An unexpected module-owned trunk conflicts with the authorized trunk set.');
+			if (!isset($trunk['name']) || !preg_match('/^DOMAINTAINS-(IN|OUT)-[a-f0-9]{12}$/D', $trunk['name'], $matches)) {
+				continue;
 			}
+			$name = $trunk['name'];
+			$role = $matches[1] === 'OUT' ? 'outbound' : 'inbound';
+			if (isset($targets[$name])) {
+				$key = $name;
+			} elseif (isset($roles[$role])) {
+				if (count($roles[$role]) !== 1) {
+					throw new \RuntimeException('Ambiguous managed trunk upgrade mapping.');
+				}
+				$key = $roles[$role][0];
+			} else {
+				throw new \RuntimeException('Unexpected managed trunk role or identity.');
+			}
+			if (isset($this->managedTrunkNames[$key])) {
+				throw new \RuntimeException('Ambiguous managed trunk upgrade mapping.');
+			}
+			$this->managedTrunkNames[$key] = $name;
 		}
 	}
 
@@ -690,7 +718,7 @@ class Domaintains implements \BMO {
 
 	private function reconcileTrunk(array $authorizedTrunk, &$configurationChanged): array {
 		$core = $this->coreApi();
-		$trunkName = $this->managedTrunkName($authorizedTrunk);
+		$trunkName = $this->resolvedManagedTrunkName($authorizedTrunk);
 		$trunks = $core->listTrunks();
 		if (!is_array($trunks)) {
 			throw new \RuntimeException('Unable to list FreePBX trunks.');
@@ -704,13 +732,14 @@ class Domaintains implements \BMO {
 		if (count($matches) === 1) {
 			$trunk = $matches[0];
 			$id = isset($trunk['trunkid']) ? $trunk['trunkid'] : null;
-			if ($id !== null && $this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk, true)) {
+			if ($id !== null && !$this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk)) {
 				$details = $core->getTrunkDetails($id);
-				if ($details['authentication'] === 'none') {
-					$this->normalizeManagedTrunkAuthentication($id, $trunk, $details, $authorizedTrunk);
-					$configurationChanged = true;
-					$trunk = $this->findManagedTrunk($core, $authorizedTrunk);
+				if (!$this->safeManagedTrunkUpgrade($trunk, $details)) {
+					throw new \RuntimeException('The module-owned trunk conflicts with the authorized configuration.');
 				}
+				$this->reconcileManagedTrunkInPlace($id, $trunk, $details, $authorizedTrunk);
+				$configurationChanged = true;
+				$trunk = $this->findManagedTrunk($core, $authorizedTrunk);
 			}
 			if ($id === null || !$this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk)) {
 				throw new \RuntimeException('The module-owned trunk conflicts with the authorized configuration.');
@@ -742,7 +771,7 @@ class Domaintains implements \BMO {
 	}
 
 	private function findManagedTrunk($core, array $authorizedTrunk) {
-		$trunkName = $this->managedTrunkName($authorizedTrunk);
+		$trunkName = $this->resolvedManagedTrunkName($authorizedTrunk);
 		$trunks = $core->listTrunks();
 		if (!is_array($trunks)) {
 			throw new \RuntimeException('Unable to list FreePBX trunks.');
@@ -756,14 +785,32 @@ class Domaintains implements \BMO {
 		return count($matches) === 1 ? $matches[0] : null;
 	}
 
-	private function normalizeManagedTrunkAuthentication($id, array $trunk, array $details, array $authorizedTrunk): void {
+	private function safeManagedTrunkUpgrade(array $trunk, $details): bool {
+		return isset($trunk['tech'], $trunk['disabled']) && $trunk['tech'] === 'pjsip' && $trunk['disabled'] === 'off'
+			&& is_array($details) && isset($details['trunk_name'], $details['registration'], $details['context'], $details['sendrpid'])
+			&& $details['trunk_name'] === $trunk['name'] && $details['registration'] === 'none'
+			&& $details['context'] === 'from-pstn' && $details['sendrpid'] === 'no'
+			&& in_array(isset($details['authentication']) ? $details['authentication'] : '', ['', 'none', 'off'], true);
+	}
+
+	private function reconcileManagedTrunkInPlace($id, array $trunk, array $details, array $authorizedTrunk): void {
 		$core = $this->coreApi();
-		$settings = array_merge($this->desiredTrunkSettings($authorizedTrunk), $trunk, $details, [
-			'authentication' => 'off',
+		$settings = array_merge($trunk, $details, $this->desiredTrunkSettings($authorizedTrunk), [
 			'trunknum' => $id,
 			'disabletrunk' => $trunk['disabled'],
 			'failtrunk' => isset($trunk['failscript']) ? $trunk['failscript'] : '',
+			'outcid' => isset($trunk['outcid']) ? $trunk['outcid'] : '',
+			'keepcid' => isset($trunk['keepcid']) ? $trunk['keepcid'] : 'off',
+			'maxchans' => isset($trunk['maxchans']) ? $trunk['maxchans'] : '',
+			'continue' => isset($trunk['continue']) ? $trunk['continue'] : 'off',
+			'dialopts' => isset($trunk['dialopts']) ? $trunk['dialopts'] : false,
+			'md5_cred' => '',
+			'auth' => '',
+			'outbound_auth' => '',
 		]);
+		if (isset($details['codecs']) && is_string($details['codecs']) && $details['codecs'] !== '') {
+			$settings['codec'] = array_fill_keys(explode(',', $details['codecs']), true);
+		}
 		$database = $this->databaseApi();
 		if (!$database->beginTransaction()) {
 			throw new \RuntimeException('Unable to start trunk normalization transaction.');
@@ -772,11 +819,11 @@ class Domaintains implements \BMO {
 		$_POST = [];
 		try {
 			if ($core->deleteTrunk($id, 'pjsip', true) !== true || (string)$core->addTrunk($trunk['name'], 'pjsip', $settings, true) !== (string)$id) {
-				throw new \RuntimeException('Unable to normalize managed trunk authentication.');
+				throw new \RuntimeException('Unable to reconcile managed trunk in place.');
 			}
 			$updated = $this->findManagedTrunk($core, $authorizedTrunk);
 			if ($updated === null || !$this->trunkMatchesAuthorizedState($id, $updated, $authorizedTrunk) || !$database->commit()) {
-				throw new \RuntimeException('Normalized managed trunk failed verification.');
+				throw new \RuntimeException('Reconciled managed trunk failed verification.');
 			}
 		} catch (\Throwable $e) {
 			if ($database->inTransaction()) {
@@ -789,16 +836,26 @@ class Domaintains implements \BMO {
 	}
 
 	private function managedTrunkName(array $authorizedTrunk): string {
+		$roleMarker = $authorizedTrunk['role'] === 'outbound' ? 'OUT' : 'IN';
+		return self::TRUNK_NAME . '-' . $roleMarker . '-' . substr(hash('sha256', $this->managedTrunkIdentity($authorizedTrunk)), 0, 12);
+	}
+
+	/** Host-derived compatibility identity until the contract supplies a stable provider-issued trunk ID. */
+	private function managedTrunkIdentity(array $authorizedTrunk): string {
 		$identity = json_encode([$authorizedTrunk['role'], $authorizedTrunk['sip_host'], $authorizedTrunk['sip_port']], JSON_UNESCAPED_SLASHES);
 		if ($identity === false) {
 			throw new \RuntimeException('Unable to derive a managed trunk name.');
 		}
-		$roleMarker = $authorizedTrunk['role'] === 'outbound' ? 'OUT' : 'IN';
-		return self::TRUNK_NAME . '-' . $roleMarker . '-' . substr(hash('sha256', $identity), 0, 12);
+		return $identity;
+	}
+
+	private function resolvedManagedTrunkName(array $authorizedTrunk): string {
+		$key = $this->managedTrunkName($authorizedTrunk);
+		return isset($this->managedTrunkNames[$key]) ? $this->managedTrunkNames[$key] : $key;
 	}
 
 	private function desiredTrunkSettings(array $authorizedTrunk): array {
-		$trunkName = $this->managedTrunkName($authorizedTrunk);
+		$trunkName = $this->resolvedManagedTrunkName($authorizedTrunk);
 		return [
 			'channelid' => $trunkName,
 			'trunk_name' => $trunkName,
@@ -827,7 +884,7 @@ class Domaintains implements \BMO {
 		];
 	}
 
-	private function trunkMatchesAuthorizedState($trunkId, array $trunk, array $authorizedTrunk, bool $allowLegacyAuthentication = false): bool {
+	private function trunkMatchesAuthorizedState($trunkId, array $trunk, array $authorizedTrunk): bool {
 		if (!isset($trunk['tech'], $trunk['disabled']) || strtolower((string)$trunk['tech']) !== 'pjsip' || strtolower((string)$trunk['disabled']) !== 'off') {
 			return false;
 		}
@@ -838,9 +895,6 @@ class Domaintains implements \BMO {
 		}
 		$expected = $this->desiredTrunkSettings($authorizedTrunk);
 		foreach (['trunk_name', 'sip_server', 'context', 'sendrpid', 'authentication', 'registration'] as $field) {
-			if ($field === 'authentication' && $allowLegacyAuthentication && isset($details[$field]) && $details[$field] === 'none') {
-				continue;
-			}
 			if (!isset($details[$field]) || (string)$details[$field] !== (string)$expected[$field]) {
 				return false;
 			}

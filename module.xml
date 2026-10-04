@@ -2,7 +2,7 @@
 <module>
   <rawname>domaintains</rawname>
   <name>DOMAINTAINS</name>
-  <version>0.3.1-dev</version>
+  <version>0.3.2-dev</version>
   <publisher>FreePBX UK</publisher>
   <license>GPLv3+</license>
   <licenselink>https://www.gnu.org/licenses/gpl-3.0.txt</licenselink>
@@ -11,6 +11,7 @@
   <more-info>https://github.com/kierknoby/domaintains</more-info>
 
   <changelog>
+    *0.3.2-dev* Adds conservative role-based migration of legacy DOMAINTAINS-managed trunks and in-place provider-host reconciliation through FreePBX Core APIs. Preserves existing trunk IDs, valid managed names, and outbound route references; normalizes SIP authentication settings and rejects ambiguous upgrade mappings. New trunks retain host-derived hash names for compatibility pending stable provider-issued trunk identities. Full local verification and safe retry diagnostics remain enforced.
     *0.3.1-dev* Distinguishes remote activation failures from local reconciliation failures and preserves safe allowlisted local errors. Persists last_error and last_error_stage, exposes diagnostic status in the GUI and CLI, and clears persisted errors after a successful retry.
     *0.3.0* Adds provider-authorised telephone numbers and automatic exact-DID inbound routes to the DOMAINTAINS Test answering destination for audible inbound-call confirmation. Conflicting administrator inbound routes fail closed. PJSIP Authentication=None uses authentication=off, Registration=None remains registration=none, and SIP authentication credentials are explicitly blank. Existing DOMAINTAINS-managed trunks are normalized in place. Outbound routing remains restricted to outbound-role trunks, and provisioned=true is persisted only after complete local verification.
     *0.2.0* Adds secure service activation through the DOMAINTAINS GUI and fwconsole command, with persistent local activation status.

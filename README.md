@@ -1,4 +1,4 @@
-# DOMAINTAINS 0.3.1-dev
+# DOMAINTAINS 0.3.2-dev
 
 DOMAINTAINS is a FreePBX module for FreePBX 16 and 17.
 

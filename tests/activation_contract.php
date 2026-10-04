@@ -58,6 +58,7 @@ class ActivationContractCoreApi {
 	public $corruptDID = false;
 	public $editCalls = 0;
 	public $didException = null;
+	public $failEdit = false;
 
 	public function getAllDIDs(): array {
 		if ($this->didException !== null) { throw $this->didException; }
@@ -97,6 +98,7 @@ class ActivationContractCoreApi {
 	}
 
 	public function addTrunk(string $name, string $technology, array $settings, bool $edit = false): string {
+		if ($edit && $this->failEdit) { throw new RuntimeException('Synthetic managed trunk edit failure.'); }
 		if ($edit) { $this->editCalls++; } else { $this->addCalls++; }
 		$this->postWasIsolated = empty($_POST);
 		$this->lastTrunkSettings = $settings;
@@ -106,9 +108,9 @@ class ActivationContractCoreApi {
 		return $trunkId;
 	}
 
-	public function seedManagedTrunk(string $host = 'sip.example.invalid', int $port = 5060, array $overrides = []): void {
-		$trunkId = 'synthetic-trunk-seeded';
-		$trunkName = 'DOMAINTAINS-OUT-' . substr(hash('sha256', json_encode(['outbound', $host, $port], JSON_UNESCAPED_SLASHES)), 0, 12);
+	public function seedManagedTrunk(string $host = 'sip.example.invalid', int $port = 5060, array $overrides = [], string $role = 'outbound', string $trunkId = 'synthetic-trunk-seeded'): void {
+		$marker = $role === 'outbound' ? 'OUT' : 'IN';
+		$trunkName = 'DOMAINTAINS-' . $marker . '-' . substr(hash('sha256', json_encode([$role, $host, $port], JSON_UNESCAPED_SLASHES)), 0, 12);
 		$this->trunks[] = ['trunkid' => $trunkId, 'name' => $trunkName, 'tech' => 'pjsip', 'disabled' => 'off'];
 		$this->details[$trunkId] = array_merge([
 			'trunk_name' => $trunkName,
@@ -143,6 +145,7 @@ class ActivationContractFirewallApi {
 }
 
 class ActivationContractRoutingApi {
+	public $coreApi = null;
 	public $routes = [];
 	public $patterns = [];
 	public $trunks = [];
@@ -181,7 +184,7 @@ class ActivationContractRoutingApi {
 	}
 
 	public function beginTransaction(): bool {
-		$this->transactionSnapshot = [$this->routes, $this->patterns, $this->trunks];
+		$this->transactionSnapshot = [$this->routes, $this->patterns, $this->trunks, $this->coreApi->trunks, $this->coreApi->details];
 		return true;
 	}
 
@@ -198,7 +201,7 @@ class ActivationContractRoutingApi {
 		if ($this->transactionSnapshot === null) {
 			return false;
 		}
-		list($this->routes, $this->patterns, $this->trunks) = $this->transactionSnapshot;
+		list($this->routes, $this->patterns, $this->trunks, $this->coreApi->trunks, $this->coreApi->details) = $this->transactionSnapshot;
 		$this->transactionSnapshot = null;
 		return true;
 	}
@@ -223,6 +226,7 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 		$this->responses = $responses;
 		$this->core = $core === null ? new ActivationContractCoreApi() : $core;
 		$this->routing = $routing === null ? new ActivationContractRoutingApi() : $routing;
+		$this->routing->coreApi = $this->core;
 		$this->firewall = $firewall === null ? new ActivationContractFirewallApi() : $firewall;
 		FreePBX::$module = $this;
 	}
@@ -418,7 +422,7 @@ $multiTrunkResponse = activation_fixture_response([
 	'trunks' => [
 		['role' => 'outbound', 'sip_host' => 'outbound-a.example.invalid', 'sip_port' => 5060],
 		['role' => 'inbound', 'sip_host' => 'inbound.example.invalid', 'sip_port' => 5061],
-		['role' => 'outbound', 'sip_host' => 'outbound-b.example.invalid', 'sip_port' => 5062],
+		['role' => 'outbound', 'sip_host' => 'outbound-b.example.invalid', 'sip_port' => 5060],
 	],
 ]);
 $multiTrunkModule = new ActivationContractModule($directory, [$multiTrunkResponse]);
@@ -428,6 +432,7 @@ activation_assert($multiTrunkResult['success'] === true, 'all authorized PBX-fac
 activation_assert(count($multiTrunkModule->coreFixture()->trunks) === 3, 'one managed PJSIP trunk should be created per authorized entry');
 activation_assert(count($multiTrunkRouteTrunks) === 2, 'only outbound-role trunks should participate in the outbound route');
 $allManagedTrunks = $multiTrunkModule->coreFixture()->trunks;
+activation_assert(count(array_unique(array_column($allManagedTrunks, 'name'))) === 3, 'same-role authorized trunks sharing a SIP port must receive distinct compatibility hash names');
 foreach ($allManagedTrunks as $managedTrunk) {
 	$settings = $multiTrunkModule->coreFixture()->getTrunkDetails($managedTrunk['trunkid']);
 	activation_assert($settings['authentication'] === 'off' && $settings['registration'] === 'none', 'every inbound and outbound managed trunk must select None / None in the FreePBX GUI');
@@ -435,6 +440,8 @@ foreach ($allManagedTrunks as $managedTrunk) {
 	activation_assert($settings['context'] === 'from-pstn' && $settings['sendrpid'] === 'no', 'every managed trunk must preserve the required context and sendrpid policy');
 }
 activation_assert($multiTrunkRouteTrunks === [$allManagedTrunks[0]['trunkid'], $allManagedTrunks[2]['trunkid']], 'outbound route must include both outbound-role trunks in authorized order and exclude inbound trunks');
+activation_assert($multiTrunkModule->activate('synthetic-test-token')['success'], 'multiple same-role same-port trunks should remain uniquely identifiable on retry');
+activation_assert($multiTrunkModule->coreFixture()->addCalls === 3 && $multiTrunkModule->coreFixture()->editCalls === 0 && $multiTrunkModule->routingFixture()->addCalls === 1, 'repeat reconciliation must not duplicate same-port trunks or their route');
 activation_cleanup($directory);
 
 $policyDirectory = activation_temp_directory();
@@ -499,7 +506,7 @@ activation_cleanup($directory);
 
 $directory = activation_temp_directory();
 $conflictingCore = new ActivationContractCoreApi();
-$conflictingCore->seedManagedTrunk('conflict.example.invalid');
+$conflictingCore->seedManagedTrunk('conflict.example.invalid', 5060, ['authentication' => 'outbound']);
 $conflictingModule = new ActivationContractModule($directory, [activation_fixture_response()], $conflictingCore, new ActivationContractRoutingApi());
 $conflictingResult = $conflictingModule->activate('synthetic-test-token');
 $conflictingState = json_decode((string)file_get_contents($directory . '/state.json'), true);
@@ -761,5 +768,113 @@ foreach ([new RuntimeException($sensitiveExceptionText), new LogicException('An 
 	activation_assert($unsafeModule->getStatus()['last_error'] === 'Local DOMAINTAINS reconciliation failed.', 'status must sanitize a non-allowlisted persisted error');
 	activation_cleanup($directory);
 }
+
+$directory = activation_temp_directory();
+$migrationCore = new ActivationContractCoreApi();
+$migrationCore->seedManagedTrunk('legacy-in.example.invalid', 5060, ['authentication' => 'none', 'username' => 'synthetic-old-user', 'auth_username' => 'synthetic-old-user', 'secret' => 'synthetic-old-secret'], 'inbound', 'synthetic-legacy-in');
+$migrationCore->seedManagedTrunk('legacy-out.example.invalid', 5062, ['authentication' => '', 'codecs' => 'ulaw,alaw'], 'outbound', 'synthetic-legacy-out');
+$legacyNamesBefore = array_column($migrationCore->trunks, 'name', 'trunkid');
+$migrationCore->seedManagedTrunk('duplicate-out.example.invalid', 5062, [], 'outbound', 'synthetic-duplicate-out');
+$administratorTrunk = ['trunkid' => 'synthetic-administrator', 'name' => 'DOMAINTAINS Administrator Link', 'tech' => 'pjsip', 'disabled' => 'off'];
+$migrationCore->trunks[] = $administratorTrunk;
+$migrationCore->details['synthetic-administrator'] = ['trunk_name' => 'DOMAINTAINS Administrator Link', 'sip_server' => 'administrator.example.invalid', 'authentication' => 'outbound'];
+$administratorDetailsBefore = $migrationCore->details['synthetic-administrator'];
+$migrationRouting = new ActivationContractRoutingApi();
+$migrationRouting->routes = [
+	['route_id' => 'synthetic-admin-route', 'name' => 'Administrator Route', 'seq' => 0],
+	['route_id' => 'synthetic-managed-route', 'name' => 'DOMAINTAINS-Outbound', 'seq' => 1],
+];
+$migrationRouting->trunks['synthetic-managed-route'] = ['synthetic-legacy-out'];
+$migrationResponse = activation_fixture_response(['trunks' => [
+	['role' => 'inbound', 'sip_host' => 'current-in.example.invalid', 'sip_port' => 5060],
+	['role' => 'outbound', 'sip_host' => 'current-out.example.invalid', 'sip_port' => 5062],
+]]);
+$migrationModule = new ActivationContractModule($directory, [$migrationResponse], $migrationCore, $migrationRouting);
+$migrationRouting->patterns['synthetic-managed-route'] = $migrationModule->routePatternPolicy('my-12345678');
+$routesBeforeMigration = [$migrationRouting->routes, $migrationRouting->patterns, $migrationRouting->trunks];
+$ambiguousResult = $migrationModule->activate('synthetic-test-token');
+activation_assert(!$ambiguousResult['success'] && $ambiguousResult['stage'] === 'local' && $ambiguousResult['message'] === 'Ambiguous managed trunk upgrade mapping.', 'duplicate legacy managed trunks must fail closed with a safe diagnostic');
+activation_assert($migrationCore->editCalls === 0 && $migrationCore->addCalls === 0, 'ambiguous role mapping must not edit or create trunks');
+activation_assert([$migrationRouting->routes, $migrationRouting->patterns, $migrationRouting->trunks] === $routesBeforeMigration, 'ambiguous mapping must not change any route data');
+$retainedState = json_decode(file_get_contents($directory . '/state.json'), true);
+$retainedState['last_error'] = 'An unexpected module-owned trunk conflicts with the authorized trunk set.';
+$retainedState['last_error_stage'] = 'local';
+file_put_contents($directory . '/state.json', json_encode($retainedState));
+$migrationCore->trunks = array_values(array_filter($migrationCore->trunks, function ($trunk) { return $trunk['trunkid'] !== 'synthetic-duplicate-out'; }));
+unset($migrationCore->details['synthetic-duplicate-out']);
+$migratedResult = $migrationModule->activate('synthetic-test-token');
+activation_assert($migratedResult['success'], 'unambiguous legacy inbound/outbound trunks should migrate on local retry');
+activation_assert(count($migrationModule->requests()) === 1 && $migrationCore->addCalls === 0 && $migrationCore->editCalls === 2, 'migration must preserve IDs without creating duplicate trunks or calling activation again');
+foreach (['synthetic-legacy-in' => ['current-in.example.invalid', '5060'], 'synthetic-legacy-out' => ['current-out.example.invalid', '5062']] as $id => $expectedEndpoint) {
+	$details = $migrationCore->getTrunkDetails($id);
+	activation_assert($details['trunk_name'] === $legacyNamesBefore[$id], 'valid legacy managed names must remain unchanged');
+	activation_assert([$details['sip_server'], $details['sip_server_port']] === $expectedEndpoint, 'legacy trunk ID must receive the currently authorized SIP host and port');
+	activation_assert($details['authentication'] === 'off' && $details['registration'] === 'none', 'none or blank legacy authentication must migrate to GUI None / None');
+	activation_assert($details['username'] === '' && $details['auth_username'] === '' && $details['secret'] === '', 'migration must explicitly clear SIP authentication credentials');
+	activation_assert($details['context'] === 'from-pstn' && $details['sendrpid'] === 'no' && $details['disabletrunk'] === 'off', 'migration must preserve the required enabled PJSIP policy');
+}
+activation_assert($migrationCore->details['synthetic-legacy-out']['codec'] === ['ulaw' => true, 'alaw' => true], 'migration should preserve existing codec choices through the Core API');
+activation_assert($migrationCore->details['synthetic-administrator'] === $administratorDetailsBefore && in_array($administratorTrunk, $migrationCore->trunks, true), 'an administrator trunk merely containing DOMAINTAINS must remain untouched');
+activation_assert($migrationRouting->addCalls === 0 && [$migrationRouting->routes, $migrationRouting->patterns, $migrationRouting->trunks] === $routesBeforeMigration, 'migration must preserve the existing outbound ID reference and all route ordering/data');
+$migratedState = json_decode(file_get_contents($directory . '/state.json'), true);
+activation_assert($migratedState['provisioned'] && !isset($migratedState['last_error'], $migratedState['last_error_stage']), 'successful migration must clear the retained 0.3.1-dev error after full verification');
+activation_assert($migrationCore->didAddCalls === 2 && $migrationModule->testDestinationRegistered(), 'migration must continue through authorized inbound routes and test destination reconciliation');
+$migrationEdits = $migrationCore->editCalls;
+$migrationReloads = $migrationModule->reloadRequests;
+activation_assert($migrationModule->activate('synthetic-test-token')['success'], 'migrated legacy names should remain recognized on subsequent attempts');
+activation_assert($migrationCore->editCalls === $migrationEdits && $migrationModule->reloadRequests === $migrationReloads, 'already-correct migrated trunks must be idempotent');
+activation_cleanup($directory);
+
+$stableCore = new ActivationContractCoreApi();
+$stableRouting = new ActivationContractRoutingApi();
+$directory = activation_temp_directory();
+$stableModule = new ActivationContractModule($directory, [$migrationResponse], $stableCore, $stableRouting);
+activation_assert($stableModule->activate('synthetic-test-token')['success'], 'fresh installation should retain current hash-naming compatibility');
+$stableNamesBefore = array_column($stableCore->trunks, 'name', 'trunkid');
+$expectedCompatibilityNames = [];
+foreach (json_decode($migrationResponse, true)['trunks'] as $authorizedTrunk) {
+	$marker = $authorizedTrunk['role'] === 'outbound' ? 'OUT' : 'IN';
+	$tuple = json_encode([$authorizedTrunk['role'], $authorizedTrunk['sip_host'], $authorizedTrunk['sip_port']], JSON_UNESCAPED_SLASHES);
+	$expectedCompatibilityNames[] = 'DOMAINTAINS-' . $marker . '-' . substr(hash('sha256', $tuple), 0, 12);
+}
+activation_assert(array_values($stableNamesBefore) === $expectedCompatibilityNames, 'host-derived identity is current/legacy compatibility behavior, not the long-term ownership identifier');
+activation_cleanup($directory);
+$directory = activation_temp_directory();
+$changedHostResponse = activation_fixture_response(['trunks' => [
+	['role' => 'inbound', 'sip_host' => 'updated-in.example.invalid', 'sip_port' => 5060],
+	['role' => 'outbound', 'sip_host' => 'updated-out.example.invalid', 'sip_port' => 5062],
+]]);
+$changedHostModule = new ActivationContractModule($directory, [$changedHostResponse], $stableCore, $stableRouting);
+activation_assert($changedHostModule->activate('synthetic-test-token')['success'], 'changed authorized hosts should reconcile in place when each role has one target');
+activation_assert($stableCore->addCalls === 2 && array_column($stableCore->trunks, 'name', 'trunkid') === $stableNamesBefore, 'provider host changes must not create duplicate trunks or change names/IDs');
+activation_assert($stableRouting->addCalls === 1, 'provider host changes must not recreate the existing outbound route');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$failedMigrationCore = new ActivationContractCoreApi();
+$failedMigrationCore->seedManagedTrunk('legacy-out.example.invalid', 5060, ['authentication' => 'none']);
+$beforeFailedMigration = [$failedMigrationCore->trunks, $failedMigrationCore->details];
+$failedMigrationCore->failEdit = true;
+$failedMigrationModule = new ActivationContractModule($directory, [activation_fixture_response()], $failedMigrationCore);
+activation_assert(!$failedMigrationModule->activate('synthetic-test-token')['success'], 'Core edit failure must leave migration pending');
+activation_assert([$failedMigrationCore->trunks, $failedMigrationCore->details] === $beforeFailedMigration, 'failed in-place edit must roll back rather than lose the existing trunk');
+$failedMigrationCore->failEdit = false;
+activation_assert($failedMigrationModule->activate('synthetic-test-token')['success'] && count($failedMigrationModule->requests()) === 1, 'failed migration should retry locally with retained authorization');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$ambiguousRoleCore = new ActivationContractCoreApi();
+$ambiguousRoleCore->seedManagedTrunk('legacy-out.example.invalid', 5060, ['authentication' => 'none']);
+$ambiguousRoleBefore = [$ambiguousRoleCore->trunks, $ambiguousRoleCore->details];
+$ambiguousRoleResponse = activation_fixture_response(['trunks' => [
+	['role' => 'outbound', 'sip_host' => 'primary.example.invalid', 'sip_port' => 5060],
+	['role' => 'outbound', 'sip_host' => 'secondary.example.invalid', 'sip_port' => 5060],
+]]);
+$ambiguousRoleModule = new ActivationContractModule($directory, [$ambiguousRoleResponse], $ambiguousRoleCore);
+$ambiguousRoleResult = $ambiguousRoleModule->activate('synthetic-test-token');
+activation_assert(!$ambiguousRoleResult['success'] && $ambiguousRoleResult['stage'] === 'local' && $ambiguousRoleResult['message'] === 'Ambiguous managed trunk upgrade mapping.', 'one legacy trunk must not be guessed into one of multiple same-role authorized targets');
+activation_assert($ambiguousRoleCore->addCalls === 0 && $ambiguousRoleCore->editCalls === 0 && [$ambiguousRoleCore->trunks, $ambiguousRoleCore->details] === $ambiguousRoleBefore, 'ambiguous multi-target legacy mapping must not create duplicates or modify the existing trunk');
+activation_assert($ambiguousRoleModule->routingFixture()->addCalls === 0, 'ambiguous legacy role mapping must not create outbound routing');
+activation_cleanup($directory);
 
 echo "Activation contract passed.\n";
