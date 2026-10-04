@@ -210,6 +210,7 @@ class ActivationContractRoutingApi {
 class ActivationContractModule extends \FreePBX\modules\Domaintains {
 	private $directory;
 	private $responses;
+	private $lastResponse = '';
 	private $requests = [];
 	private $core;
 	private $routing;
@@ -280,7 +281,13 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 	}
 
 	protected function signActivationClaim(string $claim, string $secretKey): string {
-		return str_repeat('s', 64);
+		return hash('sha512', $secretKey . $claim, true);
+	}
+
+	public $clock = null;
+
+	protected function currentTime(): int {
+		return $this->clock === null ? parent::currentTime() : $this->clock++;
 	}
 
 	protected function signatureLength(): int {
@@ -295,7 +302,14 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 		$this->requests[] = $request;
 		if ($this->remoteException !== null) { throw $this->remoteException; }
 		$this->activationHostWasLocalBeforeRequest = isset($this->firewall->networkMaps['my-connect.freepbxhosting.uk']) && $this->firewall->networkMaps['my-connect.freepbxhosting.uk'] === 'internal';
-		return (string)array_shift($this->responses);
+		if ($this->responses !== []) {
+			$this->lastResponse = (string)array_shift($this->responses);
+		}
+		return $this->lastResponse;
+	}
+
+	public function queueResponse(string $response): void {
+		$this->responses[] = $response;
 	}
 
 	public function requests(): array {
@@ -559,7 +573,7 @@ $retryRouting->failAdd = false;
 $successfulProvisioning = $localRetry->activate('synthetic-test-token');
 $completedState = json_decode((string)file_get_contents($directory . '/state.json'), true);
 activation_assert($successfulProvisioning['success'] === true && $completedState['provisioned'] === true, 'retry after local failure should complete provisioning');
-activation_assert(count($localRetry->requests()) === 1, 'pending retry must resume locally without another activation request');
+activation_assert(count($localRetry->requests()) === 2, 'pending retry must refresh provider state exactly once');
 activation_assert(file_get_contents($directory . '/signing.key') === $signingKeyBeforeLocalRetry, 'local retry must preserve the signing keypair');
 activation_assert($localRetry->reloadRequests === 2, 'each attempt that changes local configuration should request reload once');
 activation_cleanup($directory);
@@ -607,10 +621,13 @@ $stateAfterSameIdentity = file_get_contents($directory . '/state.json');
 $differentIdentityResult = $identityModule->activate('synthetic-other-token');
 $stateAfterDifferentIdentity = file_get_contents($directory . '/state.json');
 activation_assert($initialResult['success'] === true && $sameIdentityResult['success'] === true, 'same service identity activation should be idempotent');
-activation_assert($stateBeforeRetry === $stateAfterSameIdentity, 'same identity retry must not rewrite persisted state');
-activation_assert($differentIdentityResult['success'] === false, 'different service identity must be rejected');
-activation_assert($stateBeforeRetry === $stateAfterDifferentIdentity, 'different identity must not replace persisted state');
-activation_assert(count($identityModule->requests()) === 1, 'provisioned idempotency and identity rejection must not call the remote endpoint again');
+$refreshedIdentityState = json_decode($stateAfterSameIdentity, true);
+$initialIdentityState = json_decode($stateBeforeRetry, true);
+unset($refreshedIdentityState['activated_at'], $initialIdentityState['activated_at']);
+activation_assert($refreshedIdentityState === $initialIdentityState, 'unchanged provider refresh must yield equivalent persisted state');
+activation_assert($differentIdentityResult['success'] === false && $differentIdentityResult['stage'] === 'local', 'different service identity must be rejected locally');
+activation_assert($stateAfterSameIdentity === $stateAfterDifferentIdentity, 'different identity must not replace persisted state');
+activation_assert(count($identityModule->requests()) === 2, 'same identity retry refreshes once; identity rejection must not call the remote endpoint');
 activation_cleanup($directory);
 
 foreach ([['447700900123', '447700900123'], [447700900123], [''], ['+447700900123'], ['44770090012a'], '447700900123'] as $invalidNumbers) {
@@ -650,14 +667,14 @@ foreach (['16', '17'] as $freepbxVersion) {
 }
 activation_assert($inboundModule->activate('synthetic-test-token')['success'], 'repeat inbound provisioning should succeed');
 activation_assert($inboundCore->didAddCalls === 2 && $inboundModule->reloadRequests === 1, 'inbound routes and test destination should be idempotent without another reload');
-activation_assert(file_get_contents($directory . '/test-destination.json') === $markerBefore && count($inboundModule->requests()) === 1, 'test registration and remote activation should not repeat');
+activation_assert(file_get_contents($directory . '/test-destination.json') === $markerBefore && count($inboundModule->requests()) === 2, 'test registration should not repeat; retry refreshes provider state once');
 $localStatus = $inboundModule->getStatus();
 activation_assert($localStatus['inbound_numbers'] === 2 && $localStatus['test_destination'] === 'ready', 'read-only status should expose local counts and readiness');
 file_put_contents($directory . '/test-destination.json', '{"version":2}');
 activation_assert(!$inboundModule->activate('synthetic-test-token')['success'], 'a corrupt test destination must fail closed even on a previously provisioned installation');
 activation_assert(json_decode(file_get_contents($directory . '/state.json'), true)['provisioned'] === false, 'failed full re-verification must return persisted state to pending');
 file_put_contents($directory . '/test-destination.json', '{"version":1}');
-activation_assert($inboundModule->activate('synthetic-test-token')['success'] && count($inboundModule->requests()) === 1, 'repaired destination registration should resume locally without reactivation');
+activation_assert($inboundModule->activate('synthetic-test-token')['success'] && count($inboundModule->requests()) === 4, 'repaired destination registration should complete after a provider refresh');
 activation_cleanup($directory);
 
 $directory = activation_temp_directory();
@@ -689,7 +706,7 @@ activation_assert(json_decode(file_get_contents($directory . '/state.json'), tru
 $retryDIDKey = file_get_contents($directory . '/signing.key');
 $retryDIDCore->failDID = false;
 activation_assert($retryDIDModule->activate('synthetic-test-token')['success'], 'inbound failure must be locally retryable');
-activation_assert(count($retryDIDModule->requests()) === 1 && file_get_contents($directory . '/signing.key') === $retryDIDKey, 'inbound retry must retain key and not recontact activation service');
+activation_assert(count($retryDIDModule->requests()) === 2 && file_get_contents($directory . '/signing.key') === $retryDIDKey, 'inbound retry must retain key and refresh provider state once');
 activation_cleanup($directory);
 
 $directory = activation_temp_directory();
@@ -718,7 +735,7 @@ $dialplanErrorResult = $dialplanErrorModule->activate('synthetic-test-token');
 activation_assert($dialplanErrorResult === ['success' => false, 'message' => 'Test answering dialplan failed verification.', 'stage' => 'local'], 'test answering verification must return its exact safe diagnostic');
 activation_assert($dialplanErrorModule->getStatus()['last_error'] === $dialplanErrorResult['message'], 'test answering failure should remain inspectable in persisted status');
 $dialplanErrorModule->failDialplanVerification = false;
-activation_assert($dialplanErrorModule->activate('synthetic-test-token')['success'] && count($dialplanErrorModule->requests()) === 1, 'test answering failure should retry locally');
+activation_assert($dialplanErrorModule->activate('synthetic-test-token')['success'] && count($dialplanErrorModule->requests()) === 2, 'test answering failure should be retryable');
 activation_cleanup($directory);
 
 $directory = activation_temp_directory();
@@ -747,7 +764,7 @@ activation_assert($diagnosticModule->activate('synthetic-test-token')['success']
 $recoveredState = json_decode(file_get_contents($directory . '/state.json'), true);
 activation_assert(!array_key_exists('last_error', $recoveredState) && !array_key_exists('last_error_stage', $recoveredState), 'successful retry must clear both stored error fields');
 $recoveredStatus = $diagnosticModule->getStatus();
-activation_assert(!array_key_exists('last_error', $recoveredStatus) && count($diagnosticModule->requests()) === 1, 'successful retry must clear status without another remote activation');
+activation_assert(!array_key_exists('last_error', $recoveredStatus) && count($diagnosticModule->requests()) === 2, 'successful retry must clear status after one provider refresh');
 activation_cleanup($directory);
 
 foreach ([new RuntimeException($sensitiveExceptionText), new LogicException('An existing DID route conflicts with the authorized inbound route.')] as $unsafeException) {
@@ -804,7 +821,7 @@ $migrationCore->trunks = array_values(array_filter($migrationCore->trunks, funct
 unset($migrationCore->details['synthetic-duplicate-out']);
 $migratedResult = $migrationModule->activate('synthetic-test-token');
 activation_assert($migratedResult['success'], 'unambiguous legacy inbound/outbound trunks should migrate on local retry');
-activation_assert(count($migrationModule->requests()) === 1 && $migrationCore->addCalls === 0 && $migrationCore->editCalls === 2, 'migration must preserve IDs without creating duplicate trunks or calling activation again');
+activation_assert(count($migrationModule->requests()) === 2 && $migrationCore->addCalls === 0 && $migrationCore->editCalls === 2, 'migration must preserve IDs without creating duplicate trunks');
 foreach (['synthetic-legacy-in' => ['current-in.example.invalid', '5060'], 'synthetic-legacy-out' => ['current-out.example.invalid', '5062']] as $id => $expectedEndpoint) {
 	$details = $migrationCore->getTrunkDetails($id);
 	activation_assert($details['trunk_name'] === $legacyNamesBefore[$id], 'valid legacy managed names must remain unchanged');
@@ -859,7 +876,7 @@ $failedMigrationModule = new ActivationContractModule($directory, [activation_fi
 activation_assert(!$failedMigrationModule->activate('synthetic-test-token')['success'], 'Core edit failure must leave migration pending');
 activation_assert([$failedMigrationCore->trunks, $failedMigrationCore->details] === $beforeFailedMigration, 'failed in-place edit must roll back rather than lose the existing trunk');
 $failedMigrationCore->failEdit = false;
-activation_assert($failedMigrationModule->activate('synthetic-test-token')['success'] && count($failedMigrationModule->requests()) === 1, 'failed migration should retry locally with retained authorization');
+activation_assert($failedMigrationModule->activate('synthetic-test-token')['success'] && count($failedMigrationModule->requests()) === 2, 'failed migration should retry with refreshed authorization');
 activation_cleanup($directory);
 
 $directory = activation_temp_directory();
@@ -875,6 +892,74 @@ $ambiguousRoleResult = $ambiguousRoleModule->activate('synthetic-test-token');
 activation_assert(!$ambiguousRoleResult['success'] && $ambiguousRoleResult['stage'] === 'local' && $ambiguousRoleResult['message'] === 'Ambiguous managed trunk upgrade mapping.', 'one legacy trunk must not be guessed into one of multiple same-role authorized targets');
 activation_assert($ambiguousRoleCore->addCalls === 0 && $ambiguousRoleCore->editCalls === 0 && [$ambiguousRoleCore->trunks, $ambiguousRoleCore->details] === $ambiguousRoleBefore, 'ambiguous multi-target legacy mapping must not create duplicates or modify the existing trunk');
 activation_assert($ambiguousRoleModule->routingFixture()->addCalls === 0, 'ambiguous legacy role mapping must not create outbound routing');
+activation_cleanup($directory);
+
+// 0.3.3-dev: retained activation state performs a full, authoritative provider refresh.
+$directory = activation_temp_directory();
+$refreshCore = new ActivationContractCoreApi();
+$refreshModule = new ActivationContractModule($directory, [activation_fixture_response()], $refreshCore);
+$refreshModule->clock = 1700000000;
+activation_assert($refreshModule->activate('synthetic-test-token')['success'] && count($refreshModule->requests()) === 1, 'first activation must send exactly one request');
+$knownGoodState = file_get_contents($directory . '/state.json');
+$knownGood = json_decode($knownGoodState, true);
+$refreshKey = file_get_contents($directory . '/signing.key');
+
+$tamperedFingerprint = $knownGood;
+$tamperedFingerprint['public_key_fingerprint'] = hash('sha256', 'synthetic-other-public-key');
+file_put_contents($directory . '/state.json', json_encode($tamperedFingerprint));
+$wrongSigningResult = $refreshModule->activate('synthetic-test-token');
+activation_assert(!$wrongSigningResult['success'] && $wrongSigningResult['stage'] === 'local' && count($refreshModule->requests()) === 1, 'wrong signing identity must fail locally before any request');
+file_put_contents($directory . '/state.json', $knownGoodState);
+$wrongKeyResult = $refreshModule->activate('synthetic-other-token');
+activation_assert(!$wrongKeyResult['success'] && $wrongKeyResult['stage'] === 'local' && count($refreshModule->requests()) === 1, 'wrong activation key must fail locally before any request');
+activation_assert(file_get_contents($directory . '/state.json') === $knownGoodState, 'local identity rejection must not alter retained state');
+
+$refreshCountsBefore = [$refreshCore->addCalls, $refreshCore->editCalls, $refreshCore->didAddCalls, $refreshModule->reloadRequests, $refreshModule->routingFixture()->addCalls];
+$refreshModule->remoteException = new RuntimeException($sensitiveExceptionText);
+$remoteRefreshResult = $refreshModule->activate('synthetic-test-token');
+$refreshModule->remoteException = null;
+activation_assert($remoteRefreshResult === ['success' => false, 'message' => 'Unable to complete activation with the DOMAINTAINS service.', 'stage' => 'remote'], 'remote refresh failure must be generic and remote-staged');
+activation_assert(file_get_contents($directory . '/state.json') === $knownGoodState, 'remote refresh failure must leave last known-good state intact');
+activation_assert([$refreshCore->addCalls, $refreshCore->editCalls, $refreshCore->didAddCalls, $refreshModule->reloadRequests, $refreshModule->routingFixture()->addCalls] === $refreshCountsBefore, 'remote refresh failure must not run local reconciliation');
+activation_assert(count($refreshModule->requests()) === 2, 'remote refresh attempt must have sent one request');
+
+$refreshedResponse = activation_fixture_response([
+	'numbers' => ['447700900125'],
+	'trunks' => [['role' => 'outbound', 'sip_host' => 'refreshed.example.invalid', 'sip_port' => 5062]],
+]);
+$refreshModule->queueResponse($refreshedResponse);
+$refreshCore->failDID = true;
+$localAfterRefresh = $refreshModule->activate('synthetic-test-token');
+activation_assert(!$localAfterRefresh['success'] && $localAfterRefresh['stage'] === 'local', 'local failure after refresh must be local-staged');
+$refreshedPending = json_decode(file_get_contents($directory . '/state.json'), true);
+activation_assert($refreshedPending['numbers'] === ['447700900125'] && $refreshedPending['trunks'][0]['sip_host'] === 'refreshed.example.invalid', 'refreshed provider values must replace retained numbers and trunks');
+activation_assert($refreshedPending['provisioned'] === false && $refreshedPending['last_error_stage'] === 'local' && is_string($refreshedPending['last_error']), 'local failure must persist refreshed state as pending with a safe error');
+activation_assert($refreshedPending['public_key_fingerprint'] === $knownGood['public_key_fingerprint'] && $refreshedPending['activation_key_fingerprint'] === $knownGood['activation_key_fingerprint'], 'refresh must preserve identity fingerprints');
+activation_assert($refreshedPending['activated_at'] > $knownGood['activated_at'], 'refresh must update activated_at');
+$refreshedTrunk = $refreshCore->getTrunkDetails($refreshCore->trunks[0]['trunkid']);
+activation_assert(count($refreshCore->trunks) === 1 && [$refreshedTrunk['sip_server'], $refreshedTrunk['sip_server_port']] === ['refreshed.example.invalid', '5062'], 'changed SIP endpoint must reach local reconciliation in place');
+
+$refreshCore->failDID = false;
+$recoveredRefresh = $refreshModule->activate('synthetic-test-token');
+activation_assert($recoveredRefresh['success'] && count($refreshModule->requests()) === 4, 'later retry must refresh again and succeed');
+$recoveredRefreshState = json_decode(file_get_contents($directory . '/state.json'), true);
+activation_assert($recoveredRefreshState['provisioned'] === true && !isset($recoveredRefreshState['last_error'], $recoveredRefreshState['last_error_stage']), 'successful retry must clear the persisted error');
+activation_assert(in_array('447700900125', array_column($refreshCore->dids, 'extension'), true), 'changed number must reach local reconciliation');
+
+$claims = array_map(function ($request) { return json_decode($request, true); }, $refreshModule->requests());
+for ($i = 1; $i < count($claims); $i++) {
+	activation_assert($claims[$i]['claim']['public_key'] === $claims[0]['claim']['public_key'], 'refresh must use the same public signing identity');
+	activation_assert($claims[$i]['claim']['token'] === 'synthetic-test-token', 'refresh claim must carry the entered activation key');
+	activation_assert($claims[$i]['claim']['timestamp'] > $claims[$i - 1]['claim']['timestamp'], 'refresh must use a fresh timestamp');
+	activation_assert($claims[$i]['claim']['nonce'] !== $claims[$i - 1]['claim']['nonce'], 'refresh must use a fresh nonce');
+	activation_assert($claims[$i]['signature'] !== $claims[$i - 1]['signature'], 'refresh must use a fresh signature');
+}
+activation_assert(file_get_contents($directory . '/signing.key') === $refreshKey, 'refresh must not replace the signing key');
+
+$diagnosticOutput = json_encode([$wrongSigningResult, $wrongKeyResult, $remoteRefreshResult, $localAfterRefresh, $refreshModule->getStatus(), $refreshedPending], JSON_UNESCAPED_SLASHES);
+foreach (array_merge(['synthetic-test-token', 'synthetic-test-signing-key', 'synthetic-signature', 'synthetic-secret', '/synthetic-private-path', 'raw-synthetic-response', '#0', 'RuntimeException', $directory], array_column($claims, 'signature'), array_map(function ($claim) { return $claim['claim']['nonce']; }, $claims)) as $sensitiveMarker) {
+	activation_assert(strpos($diagnosticOutput, $sensitiveMarker) === false, 'refresh diagnostics must not contain secrets or request material');
+}
 activation_cleanup($directory);
 
 echo "Activation contract passed.\n";

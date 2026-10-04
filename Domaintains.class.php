@@ -13,7 +13,7 @@ namespace FreePBX\modules;
 class Domaintains implements \BMO {
 
 	/** Fallback only. Authoritative version lives in module.xml. */
-	const VERSION = '0.3.2-dev';
+	const VERSION = '0.3.3-dev';
 	const ACTIVATION_ENDPOINT = 'https://my-connect.freepbxhosting.uk/activate';
 	const TRUNK_NAME = 'DOMAINTAINS';
 	const ROUTE_NAME = 'DOMAINTAINS-Outbound';
@@ -152,7 +152,7 @@ class Domaintains implements \BMO {
 				]);
 			}
 			$this->ensureActivationHostInLocalZone();
-			if ($existingState === null && !$this->supportsHttpsTransport()) {
+			if (!$this->supportsHttpsTransport()) {
 				return ['success' => false, 'message' => _('Activation is unavailable because HTTPS support is missing.'), 'stage' => 'remote'];
 			}
 			list($publicKey, $secretKey) = $this->loadOrCreateSigningKeypair($existingState === null);
@@ -165,61 +165,22 @@ class Domaintains implements \BMO {
 				if (!hash_equals($existingState->activation_key_fingerprint, $activationKeyFingerprint)) {
 					return ['success' => false, 'message' => _('This installation is already linked to a different activation identity.'), 'stage' => 'local'];
 				}
-				$this->clearSigningSecret($secretKey);
-				$responseValues = $this->authorizedValues($existingState);
-				$state = array_merge($this->authorizedValues($existingState), [
-					'provisioned' => $existingState->provisioned,
-					'activated_at' => $existingState->activated_at,
-					'public_key_fingerprint' => $existingState->public_key_fingerprint,
-					'activation_key_fingerprint' => $existingState->activation_key_fingerprint,
-				]);
-			} else {
-				$claim = [
-					'token' => $activationKey,
-					'public_key' => base64_encode($publicKey),
-					'timestamp' => time(),
-					'nonce' => base64_encode(random_bytes(24)),
-				];
-				$canonicalClaim = json_encode($claim, JSON_UNESCAPED_SLASHES);
-				if ($canonicalClaim === false) {
-					throw new \RuntimeException('Unable to encode activation claim.');
-				}
-
-				try {
-					$signature = $this->signActivationClaim($canonicalClaim, $secretKey);
-				} catch (\Throwable $e) {
-					$this->clearSigningSecret($secretKey);
-					throw new \RuntimeException('Unable to sign activation claim.');
-				}
-				$this->clearSigningSecret($secretKey);
-				if (!is_string($signature) || strlen($signature) !== $this->signatureLength()) {
-					throw new \RuntimeException('Unable to sign activation claim.');
-				}
-				$request = json_encode([
-					'action' => 'activate',
-					'claim' => $claim,
-					'signature' => base64_encode($signature),
-				], JSON_UNESCAPED_SLASHES);
-				if ($request === false) {
-					throw new \RuntimeException('Unable to encode activation request.');
-				}
-
-				$responseValues = $this->validateActivationResponse($this->sendActivationRequest($request));
-				$state = array_merge($responseValues, [
-					'provisioned' => false,
-					'activated_at' => time(),
-					'public_key_fingerprint' => $publicKeyFingerprint,
-					'activation_key_fingerprint' => $activationKeyFingerprint,
-				]);
-				$this->writeActivationState($state);
-				$stage = 'local';
 			}
 
+			// Retained state stays the last known-good record until a validated provider refresh is persisted.
+			$stage = 'remote';
+			$request = $this->signedActivationRequest($activationKey, $publicKey, $secretKey);
+			$responseValues = $this->validateActivationResponse($this->sendActivationRequest($request));
+			$state = array_merge($responseValues, [
+				'provisioned' => false,
+				'activated_at' => $this->currentTime(),
+				'public_key_fingerprint' => $publicKeyFingerprint,
+				'activation_key_fingerprint' => $activationKeyFingerprint,
+			]);
+			$this->writeActivationState($state);
+			$stage = 'local';
+
 			try {
-				if ($state['provisioned']) {
-					$state['provisioned'] = false;
-					$this->writeActivationState($state);
-				}
 				$this->reconcileLocalConfiguration($state, $configurationChanged);
 				if ($configurationChanged) {
 					$this->requestConfigurationReload();
@@ -415,6 +376,42 @@ class Domaintains implements \BMO {
 		} else {
 			$secretKey = '';
 		}
+	}
+
+	protected function currentTime(): int {
+		return time();
+	}
+
+	private function signedActivationRequest(string $activationKey, string $publicKey, string &$secretKey): string {
+		$claim = [
+			'token' => $activationKey,
+			'public_key' => base64_encode($publicKey),
+			'timestamp' => $this->currentTime(),
+			'nonce' => base64_encode(random_bytes(24)),
+		];
+		$canonicalClaim = json_encode($claim, JSON_UNESCAPED_SLASHES);
+		if ($canonicalClaim === false) {
+			throw new \RuntimeException('Unable to encode activation claim.');
+		}
+		try {
+			$signature = $this->signActivationClaim($canonicalClaim, $secretKey);
+		} catch (\Throwable $e) {
+			throw new \RuntimeException('Unable to sign activation claim.');
+		} finally {
+			$this->clearSigningSecret($secretKey);
+		}
+		if (!is_string($signature) || strlen($signature) !== $this->signatureLength()) {
+			throw new \RuntimeException('Unable to sign activation claim.');
+		}
+		$request = json_encode([
+			'action' => 'activate',
+			'claim' => $claim,
+			'signature' => base64_encode($signature),
+		], JSON_UNESCAPED_SLASHES);
+		if ($request === false) {
+			throw new \RuntimeException('Unable to encode activation request.');
+		}
+		return $request;
 	}
 
 	private function activationKeyFingerprint(string $activationKey, string $secretKey): string {

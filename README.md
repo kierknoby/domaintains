@@ -1,4 +1,4 @@
-# DOMAINTAINS 0.3.2-dev
+# DOMAINTAINS 0.3.3-dev
 
 DOMAINTAINS is a FreePBX module for FreePBX 16 and 17.
 
@@ -28,7 +28,8 @@ fwconsole domaintains status --json
 ```
 
 An activated installation cannot be linked to another service identity from
-the module.
+the module. Activating again with the same key and signing identity refreshes
+the provider-authorised configuration and repairs local configuration to match.
 
 ## Repository
 
