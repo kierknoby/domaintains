@@ -59,6 +59,8 @@ class ActivationContractCoreApi {
 	public $editCalls = 0;
 	public $didException = null;
 	public $failEdit = false;
+	public $trunkListCalls = 0;
+	public $corruptMaxChannelsAfterListCalls = null;
 
 	public function getAllDIDs(): array {
 		if ($this->didException !== null) { throw $this->didException; }
@@ -78,7 +80,15 @@ class ActivationContractCoreApi {
 	}
 
 	public function listTrunks(): array {
-		return $this->trunks;
+		$this->trunkListCalls++;
+		$trunks = $this->trunks;
+		if ($this->corruptMaxChannelsAfterListCalls !== null && $this->trunkListCalls > $this->corruptMaxChannelsAfterListCalls) {
+			foreach ($trunks as &$trunk) {
+				unset($trunk['maxchans']);
+			}
+			unset($trunk);
+		}
+		return $trunks;
 	}
 
 	public function getTrunkDetails($trunkId) {
@@ -103,15 +113,23 @@ class ActivationContractCoreApi {
 		$this->postWasIsolated = empty($_POST);
 		$this->lastTrunkSettings = $settings;
 		$trunkId = $edit ? $settings['trunknum'] : 'synthetic-trunk-' . $this->addCalls;
-		$this->trunks[] = ['trunkid' => $trunkId, 'name' => $name, 'tech' => $technology, 'disabled' => 'off'];
-		$this->details[$trunkId] = $settings;
+		$this->trunks[] = [
+			'trunkid' => $trunkId,
+			'name' => $name,
+			'tech' => $technology,
+			'disabled' => 'off',
+			'maxchans' => isset($settings['maxchans']) ? (string)$settings['maxchans'] : '',
+		];
+		$details = $settings;
+		unset($details['maxchans']);
+		$this->details[$trunkId] = $details;
 		return $trunkId;
 	}
 
 	public function seedManagedTrunk(string $host = 'sip.example.invalid', int $port = 5060, array $overrides = [], string $role = 'outbound', string $trunkId = 'synthetic-trunk-seeded'): void {
 		$marker = $role === 'outbound' ? 'OUT' : 'IN';
 		$trunkName = 'DOMAINTAINS-' . $marker . '-' . substr(hash('sha256', json_encode([$role, $host, $port], JSON_UNESCAPED_SLASHES)), 0, 12);
-		$this->trunks[] = ['trunkid' => $trunkId, 'name' => $trunkName, 'tech' => 'pjsip', 'disabled' => 'off'];
+		$this->trunks[] = ['trunkid' => $trunkId, 'name' => $trunkName, 'tech' => 'pjsip', 'disabled' => 'off', 'maxchans' => '5'];
 		$this->details[$trunkId] = array_merge([
 			'trunk_name' => $trunkName,
 			'sip_server' => $host,
@@ -215,6 +233,7 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 	private $core;
 	private $routing;
 	private $firewall;
+	public $localHostnameValue = 'my-12345678';
 	public $activationHostWasLocalBeforeRequest = false;
 	public $reloadRequests = 0;
 	public $remoteException = null;
@@ -263,6 +282,10 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 
 	protected function supportsSodium(): bool {
 		return true;
+	}
+
+	protected function localHostname(): string {
+		return $this->localHostnameValue;
 	}
 
 	protected function supportsHttpsTransport(): bool {
@@ -339,6 +362,7 @@ function activation_fixture_response(array $overrides = []): string {
 		'service' => 'my-12345678',
 		'profile' => 'test-profile',
 		'domaintains_hostname' => 'pbx.example.invalid',
+		'max_channels' => 5,
 		'numbers' => ['447700900123', '447700900124'],
 		'trunks' => [
 			['role' => 'outbound', 'sip_host' => 'sip.example.invalid', 'sip_port' => 5060],
@@ -383,9 +407,10 @@ activation_assert($_POST === ['activation_key' => 'synthetic-test-token'], 'acti
 $_POST = $originalPost;
 activation_assert($result['success'] === true, 'ok=true with all required flat fields should activate');
 $stored = json_decode((string)file_get_contents($directory . '/state.json'), true);
-foreach (['service', 'trunks', 'profile', 'domaintains_hostname', 'numbers'] as $field) {
+foreach (['service', 'trunks', 'profile', 'domaintains_hostname', 'numbers', 'max_channels'] as $field) {
 	activation_assert(array_key_exists($field, $stored), 'persisted state should include required field ' . $field);
 }
+activation_assert($stored['max_channels'] === 5, 'persisted state should contain provider-authorized max_channels');
 activation_assert($stored['provisioned'] === true, 'fresh local provisioning should set provisioned only after verification');
 activation_assert($module->coreFixture()->addCalls === 1, 'fresh provisioning should create one PJSIP trunk');
 activation_assert($module->coreFixture()->postWasIsolated, 'Core trunk creation must not receive the activation POST body');
@@ -396,11 +421,15 @@ activation_assert($module->firewallFixture()->addCalls === 1 && $module->activat
 $trunkRecord = $module->coreFixture()->trunks[0];
 $trunkSettings = $module->coreFixture()->getTrunkDetails($trunkRecord['trunkid']);
 activation_assert($trunkRecord['tech'] === 'pjsip', 'managed trunk should use PJSIP');
+activation_assert(!array_key_exists('maxchans', $trunkSettings), 'technology-specific trunk details must not supply the main-record maxchans field');
 activation_assert($trunkSettings['authentication'] === 'off' && $trunkSettings['registration'] === 'none', 'managed trunk must render both FreePBX GUI None selections without authentication or registration');
 activation_assert($trunkSettings['sip_server'] === 'sip.example.invalid' && $trunkSettings['sip_server_port'] === '5060', 'managed trunk should use the authorized SIP server and port');
+activation_assert($trunkRecord['maxchans'] === '5', 'new outbound managed trunk should use the provider-authorized channel limit');
 activation_assert($trunkSettings['context'] === 'from-pstn' && $trunkSettings['sendrpid'] === 'no', 'managed trunk should apply the required context and sendrpid policy');
 $routeTrunks = array_values($module->routingFixture()->trunks);
 activation_assert(count($routeTrunks) === 1 && count($routeTrunks[0]) === 1 && $routeTrunks[0][0] === $trunkRecord['trunkid'], 'outbound route must use only the DOMAINTAINS trunk');
+$firstClaim = json_decode($module->requests()[0], true)['claim'];
+activation_assert(array_keys($firstClaim) === ['token', 'public_key', 'timestamp', 'nonce', 'service'] && $firstClaim['service'] === 'my-12345678', 'signed claim must append the validated local service identity in the canonical field order');
 $storedFiles = file_get_contents($directory . '/state.json') . file_get_contents($directory . '/signing.key');
 activation_assert(strpos($storedFiles, 'synthetic-test-token') === false, 'successful activation must not persist the plaintext activation token');
 activation_cleanup($directory);
@@ -449,6 +478,7 @@ $allManagedTrunks = $multiTrunkModule->coreFixture()->trunks;
 activation_assert(count(array_unique(array_column($allManagedTrunks, 'name'))) === 3, 'same-role authorized trunks sharing a SIP port must receive distinct compatibility hash names');
 foreach ($allManagedTrunks as $managedTrunk) {
 	$settings = $multiTrunkModule->coreFixture()->getTrunkDetails($managedTrunk['trunkid']);
+	activation_assert($managedTrunk['maxchans'] === '5', 'inbound and outbound managed trunks must both use the authorized channel limit');
 	activation_assert($settings['authentication'] === 'off' && $settings['registration'] === 'none', 'every inbound and outbound managed trunk must select None / None in the FreePBX GUI');
 	activation_assert($settings['auth_username'] === '' && $settings['username'] === '' && $settings['secret'] === '', 'every managed trunk must have blank authentication credentials');
 	activation_assert($settings['context'] === 'from-pstn' && $settings['sendrpid'] === 'no', 'every managed trunk must preserve the required context and sendrpid policy');
@@ -639,6 +669,111 @@ $missingNumbers = json_decode(activation_fixture_response(), true);
 unset($missingNumbers['numbers']);
 list($result, $directory) = activation_attempt(json_encode($missingNumbers));
 activation_assert($result['success'] === false, 'missing numbers must not be invented by the PBX');
+activation_cleanup($directory);
+
+foreach ([null, '5', 0, -1, 501, 5.5] as $invalidMaxChannels) {
+	$invalidEntitlement = json_decode(activation_fixture_response(), true);
+	if ($invalidMaxChannels === null) {
+		unset($invalidEntitlement['max_channels']);
+	} else {
+		$invalidEntitlement['max_channels'] = $invalidMaxChannels;
+	}
+	list($result, $directory) = activation_attempt(json_encode($invalidEntitlement));
+	activation_assert($result['success'] === false && !file_exists($directory . '/state.json'), 'missing, non-integer, zero, negative, or out-of-range max_channels must be rejected');
+	activation_cleanup($directory);
+}
+
+foreach ([1, 500] as $validMaxChannels) {
+	list($result, $directory, $boundaryModule) = activation_attempt(activation_fixture_response(['max_channels' => $validMaxChannels]));
+	$boundaryState = json_decode(file_get_contents($directory . '/state.json'), true);
+	$boundaryTrunk = $boundaryModule->coreFixture()->trunks[0];
+	activation_assert($result['success'] && $boundaryState['max_channels'] === $validMaxChannels, 'max_channels boundary ' . $validMaxChannels . ' must be accepted and persisted');
+	activation_assert($boundaryTrunk['maxchans'] === (string)$validMaxChannels, 'accepted max_channels boundary must be applied to the managed trunk');
+	activation_cleanup($directory);
+}
+
+foreach ([
+	'my-12345678' => 'my-12345678',
+	'my-12345678.example.invalid' => 'my-12345678',
+	" \tMY-12345678.Example.invalid \n" => 'my-12345678',
+] as $localHostname => $expectedService) {
+	$directory = activation_temp_directory();
+	$hostnameModule = new ActivationContractModule($directory, [activation_fixture_response()]);
+	$hostnameModule->localHostnameValue = $localHostname;
+	$hostnameResult = $hostnameModule->activate('synthetic-test-token');
+	$hostnameClaim = json_decode($hostnameModule->requests()[0], true)['claim'];
+	activation_assert($hostnameResult['success'] && $hostnameClaim['service'] === $expectedService, 'hostname should normalize to the first lowercase service label');
+	activation_cleanup($directory);
+}
+
+$directory = activation_temp_directory();
+$invalidHostModule = new ActivationContractModule($directory, [activation_fixture_response()]);
+$invalidHostModule->localHostnameValue = 'pbx.example.invalid';
+$invalidHostResult = $invalidHostModule->activate('synthetic-test-token');
+activation_assert(!$invalidHostResult['success'] && $invalidHostResult['stage'] === 'local' && $invalidHostModule->requests() === [], 'invalid local service identity must fail before sending an activation claim');
+activation_assert(!file_exists($directory . '/signing.key') && $invalidHostModule->firewallFixture()->addCalls === 0, 'invalid local service identity must not create identity state or modify the firewall');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$legacyStateModule = new ActivationContractModule($directory, [activation_fixture_response()]);
+activation_assert($legacyStateModule->activate('synthetic-test-token')['success'], 'fixture activation should create current retained state');
+$legacyState = json_decode(file_get_contents($directory . '/state.json'), true);
+unset($legacyState['max_channels']);
+file_put_contents($directory . '/state.json', json_encode($legacyState, JSON_UNESCAPED_SLASHES) . "\n");
+$legacyStateBeforeRetry = file_get_contents($directory . '/state.json');
+$legacyStateRequestCount = count($legacyStateModule->requests());
+$legacyStateResult = $legacyStateModule->activate('synthetic-test-token');
+activation_assert(!$legacyStateResult['success'] && $legacyStateResult['stage'] === 'local-state', 'retained state predating required max_channels must be classified as a local-state failure');
+activation_assert(count($legacyStateModule->requests()) === $legacyStateRequestCount && file_get_contents($directory . '/state.json') === $legacyStateBeforeRetry, 'legacy state must fail closed without a provider request or an invented entitlement');
+activation_assert(strpos(json_encode($legacyStateResult), 'synthetic-test-token') === false && strpos(json_encode($legacyStateResult), $directory) === false, 'legacy-state failure output must not expose activation input or filesystem paths');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$mismatchedProviderService = 'my-87654321';
+activation_assert((bool)preg_match('/^my-[0-9]{8}$/D', $mismatchedProviderService), 'mismatch fixture must pass basic service identity format validation');
+$mismatchedServiceModule = new ActivationContractModule($directory, [activation_fixture_response(['service' => $mismatchedProviderService])]);
+$mismatchedServiceResult = $mismatchedServiceModule->activate('synthetic-test-token');
+activation_assert(!$mismatchedServiceResult['success'] && $mismatchedServiceResult['stage'] === 'remote', 'valid but different provider service identity must be rejected');
+activation_assert(json_decode($mismatchedServiceModule->requests()[0], true)['claim']['service'] === 'my-12345678', 'mismatch claim must retain the local synthetic service identity');
+activation_assert(!file_exists($directory . '/state.json'), 'mismatched service response must not be persisted');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$driftCore = new ActivationContractCoreApi();
+$driftResponse = activation_fixture_response(['trunks' => [
+	['role' => 'inbound', 'sip_host' => 'inbound.example.invalid', 'sip_port' => 5060],
+	['role' => 'outbound', 'sip_host' => 'outbound.example.invalid', 'sip_port' => 5062],
+]]);
+$adminTrunk = ['trunkid' => 'synthetic-admin', 'name' => 'Administrator Link', 'tech' => 'pjsip', 'disabled' => 'off', 'maxchans' => '17'];
+$driftCore->trunks[] = $adminTrunk;
+$driftCore->details['synthetic-admin'] = ['trunk_name' => 'Administrator Link', 'sip_server' => 'admin.example.invalid'];
+$adminTrunkDetails = $driftCore->details['synthetic-admin'];
+$driftModule = new ActivationContractModule($directory, [$driftResponse], $driftCore);
+activation_assert($driftModule->activate('synthetic-test-token')['success'], 'both authorized trunk roles should initially provision');
+foreach ($driftCore->trunks as $index => $managedTrunk) {
+	if ($managedTrunk['trunkid'] !== 'synthetic-admin') {
+		$driftCore->trunks[$index]['maxchans'] = '9';
+	}
+}
+$driftModule->queueResponse($driftResponse);
+activation_assert($driftModule->activate('synthetic-test-token')['success'], 'provider refresh should repair manual channel-limit drift');
+activation_assert($driftCore->editCalls === 2, 'wrong maxchans on inbound and outbound managed trunks must be repaired in place');
+foreach (array_filter($driftCore->trunks, function ($trunk) { return $trunk['trunkid'] !== 'synthetic-admin'; }) as $managedTrunk) {
+	activation_assert($managedTrunk['maxchans'] === '5', 'reconciled managed trunks must have the authorized maxchans');
+}
+activation_assert($driftCore->details['synthetic-admin'] === $adminTrunkDetails && in_array($adminTrunk, $driftCore->trunks, true), 'channel-limit reconciliation must not modify administrator-owned trunks');
+$editCountAfterRepair = $driftCore->editCalls;
+$driftModule->queueResponse($driftResponse);
+activation_assert($driftModule->activate('synthetic-test-token')['success'] && $driftCore->editCalls === $editCountAfterRepair, 'correct maxchans must not cause unnecessary managed trunk edits');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$verificationCore = new ActivationContractCoreApi();
+$verificationCore->corruptMaxChannelsAfterListCalls = 3;
+$verificationModule = new ActivationContractModule($directory, [activation_fixture_response()], $verificationCore);
+$verificationResult = $verificationModule->activate('synthetic-test-token');
+activation_assert(!$verificationResult['success'] && $verificationResult['stage'] === 'local' && $verificationResult['message'] === 'A local PJSIP trunk failed verification.', 'final local verification must reject a managed trunk missing its main-record maxchans');
+activation_assert(json_decode(file_get_contents($directory . '/state.json'), true)['provisioned'] === false, 'failed final channel-limit verification must leave activation pending');
 activation_cleanup($directory);
 
 $directory = activation_temp_directory();
@@ -950,6 +1085,7 @@ $claims = array_map(function ($request) { return json_decode($request, true); },
 for ($i = 1; $i < count($claims); $i++) {
 	activation_assert($claims[$i]['claim']['public_key'] === $claims[0]['claim']['public_key'], 'refresh must use the same public signing identity');
 	activation_assert($claims[$i]['claim']['token'] === 'synthetic-test-token', 'refresh claim must carry the entered activation key');
+	activation_assert($claims[$i]['claim']['service'] === 'my-12345678', 'refresh claim must retain the validated local service identity');
 	activation_assert($claims[$i]['claim']['timestamp'] > $claims[$i - 1]['claim']['timestamp'], 'refresh must use a fresh timestamp');
 	activation_assert($claims[$i]['claim']['nonce'] !== $claims[$i - 1]['claim']['nonce'], 'refresh must use a fresh nonce');
 	activation_assert($claims[$i]['signature'] !== $claims[$i - 1]['signature'], 'refresh must use a fresh signature');

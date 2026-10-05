@@ -2,7 +2,7 @@
 <module>
   <rawname>domaintains</rawname>
   <name>DOMAINTAINS</name>
-  <version>0.3.3-dev</version>
+  <version>0.3.4-dev</version>
   <publisher>FreePBX UK</publisher>
   <license>GPLv3+</license>
   <licenselink>https://www.gnu.org/licenses/gpl-3.0.txt</licenselink>
@@ -11,6 +11,7 @@
   <more-info>https://github.com/kierknoby/domaintains</more-info>
 
   <changelog>
+    *0.3.4-dev* Adds the local PBX service identity to the signed activation claim in canonical token, public_key, timestamp, nonce, service order, validates the identity against ^my-[0-9]{8}$, and requires the provider response service identity to match the local PBX. Adds provider-authorised max_channels support with a strict JSON integer range of 1 through 500, applies the authorised limit to inbound and outbound DOMAINTAINS-managed trunks, repairs manual maxchans drift in place during refresh, and includes the limit in final local verification. Retained pre-entitlement state without max_channels fails closed as a local-state condition; no entitlement is invented and the stale state is not rewritten. Expands the README with administrator-first installation, ownership, refresh and security guidance, followed by provider-neutral developer guidance for implementing compatible provisioning, billing/order, carrier/number, DNS and SIP/SBC integrations without disclosing private production infrastructure.
     *0.3.3-dev* Retrying activation on an installation with retained state now performs a full provider refresh: after local signing-identity and activation-key checks, a freshly signed claim (new timestamp and nonce, same signing identity) is sent and the validated provider response becomes authoritative. Refreshed numbers and trunks are persisted as pending before FreePBX changes, then reconciled and verified end to end, providing self-repair for changed numbers and SIP endpoints. Remote failures leave the last known-good state untouched and make no local changes; local failures keep the refreshed state pending with a safe diagnostic for retry.
     *0.3.2-dev* Adds conservative role-based migration of legacy DOMAINTAINS-managed trunks and in-place provider-host reconciliation through FreePBX Core APIs. Preserves existing trunk IDs, valid managed names, and outbound route references; normalizes SIP authentication settings and rejects ambiguous upgrade mappings. New trunks retain host-derived hash names for compatibility pending stable provider-issued trunk identities. Full local verification and safe retry diagnostics remain enforced.
     *0.3.1-dev* Distinguishes remote activation failures from local reconciliation failures and preserves safe allowlisted local errors. Persists last_error and last_error_stage, exposes diagnostic status in the GUI and CLI, and clears persisted errors after a successful retry.

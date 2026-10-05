@@ -13,7 +13,7 @@ namespace FreePBX\modules;
 class Domaintains implements \BMO {
 
 	/** Fallback only. Authoritative version lives in module.xml. */
-	const VERSION = '0.3.3-dev';
+	const VERSION = '0.3.4-dev';
 	const ACTIVATION_ENDPOINT = 'https://my-connect.freepbxhosting.uk/activate';
 	const TRUNK_NAME = 'DOMAINTAINS';
 	const ROUTE_NAME = 'DOMAINTAINS-Outbound';
@@ -120,7 +120,7 @@ class Domaintains implements \BMO {
 			return ['success' => false, 'message' => _('Activation is unavailable because sodium support is missing.'), 'stage' => 'remote'];
 		}
 		$lock = null;
-		$stage = 'remote';
+		$stage = 'local';
 		$state = null;
 		$configurationChanged = false;
 		$reloadRequested = false;
@@ -141,6 +141,7 @@ class Domaintains implements \BMO {
 				throw new \RuntimeException('Unable to lock activation state.');
 			}
 
+			$stage = 'local-state';
 			$existingState = $this->readActivationState();
 			if ($existingState !== null) {
 				$stage = 'local';
@@ -151,6 +152,8 @@ class Domaintains implements \BMO {
 					'activation_key_fingerprint' => $existingState->activation_key_fingerprint,
 				]);
 			}
+			$stage = 'local';
+			$localService = $this->validatedLocalServiceIdentity();
 			$this->ensureActivationHostInLocalZone();
 			if (!$this->supportsHttpsTransport()) {
 				return ['success' => false, 'message' => _('Activation is unavailable because HTTPS support is missing.'), 'stage' => 'remote'];
@@ -169,8 +172,8 @@ class Domaintains implements \BMO {
 
 			// Retained state stays the last known-good record until a validated provider refresh is persisted.
 			$stage = 'remote';
-			$request = $this->signedActivationRequest($activationKey, $publicKey, $secretKey);
-			$responseValues = $this->validateActivationResponse($this->sendActivationRequest($request));
+			$request = $this->signedActivationRequest($activationKey, $publicKey, $secretKey, $localService);
+			$responseValues = $this->validateActivationResponse($this->sendActivationRequest($request), $localService);
 			$state = array_merge($responseValues, [
 				'provisioned' => false,
 				'activated_at' => $this->currentTime(),
@@ -201,9 +204,11 @@ class Domaintains implements \BMO {
 			}
 			return ['success' => true, 'message' => _('DOMAINTAINS activation and local configuration completed successfully.')];
 		} catch (\Throwable $e) {
-			$message = $stage === 'local'
-				? $this->safeLocalErrorMessage($e instanceof \RuntimeException ? $e->getMessage() : '')
-				: _('Unable to complete activation with the DOMAINTAINS service.');
+			$message = $stage === 'local-state'
+				? _('Local activation state is incomplete or incompatible. Contact support.')
+				: ($stage === 'local'
+					? $this->safeLocalErrorMessage($e instanceof \RuntimeException ? $e->getMessage() : '')
+					: _('Unable to complete activation with the DOMAINTAINS service.'));
 			if ($stage === 'local' && is_array($state)) {
 				$state['provisioned'] = false;
 				$state['last_error'] = $message;
@@ -354,6 +359,21 @@ class Domaintains implements \BMO {
 		return $record;
 	}
 
+	protected function localHostname(): string {
+		$hostname = gethostname();
+		return is_string($hostname) ? $hostname : '';
+	}
+
+	private function validatedLocalServiceIdentity(): string {
+		$hostname = strtolower(trim($this->localHostname()));
+		$labelSeparator = strpos($hostname, '.');
+		$service = $labelSeparator === false ? $hostname : substr($hostname, 0, $labelSeparator);
+		if (!preg_match('/^my-[0-9]{8}$/D', $service)) {
+			throw new \RuntimeException('Invalid local service identity.');
+		}
+		return $service;
+	}
+
 	protected function supportsSodium(): bool {
 		return function_exists('sodium_crypto_sign_detached') && function_exists('sodium_crypto_sign_keypair') && function_exists('sodium_crypto_sign_publickey_from_secretkey');
 	}
@@ -382,12 +402,13 @@ class Domaintains implements \BMO {
 		return time();
 	}
 
-	private function signedActivationRequest(string $activationKey, string $publicKey, string &$secretKey): string {
+	private function signedActivationRequest(string $activationKey, string $publicKey, string &$secretKey, string $service): string {
 		$claim = [
 			'token' => $activationKey,
 			'public_key' => base64_encode($publicKey),
 			'timestamp' => $this->currentTime(),
 			'nonce' => base64_encode(random_bytes(24)),
+			'service' => $service,
 		];
 		$canonicalClaim = json_encode($claim, JSON_UNESCAPED_SLASHES);
 		if ($canonicalClaim === false) {
@@ -418,19 +439,23 @@ class Domaintains implements \BMO {
 		return hash_hmac('sha256', "domaintains-activation-key\0" . $activationKey, $secretKey);
 	}
 
-	private function validateActivationResponse(string $response): array {
+	private function validateActivationResponse(string $response, string $localService): array {
 		$decoded = json_decode($response);
 		if (json_last_error() !== JSON_ERROR_NONE || !is_object($decoded) || !isset($decoded->ok) || $decoded->ok !== true) {
 			throw new \RuntimeException('Invalid activation response.');
 		}
-		return $this->validateProvisioningFields($decoded);
+		$values = $this->validateProvisioningFields($decoded);
+		if ($values['service'] !== $localService) {
+			throw new \RuntimeException('Activation response service identity does not match the local service.');
+		}
+		return $values;
 	}
 
 	private function validateProvisioningFields($data): array {
 		if (is_object($data)) {
 			$data = (array)$data;
 		}
-		$fields = ['service', 'profile', 'domaintains_hostname', 'trunks', 'numbers'];
+		$fields = ['service', 'profile', 'domaintains_hostname', 'trunks', 'numbers', 'max_channels'];
 		$values = [];
 		foreach ($fields as $field) {
 			if (!array_key_exists($field, $data)) {
@@ -445,6 +470,9 @@ class Domaintains implements \BMO {
 		}
 		if (!preg_match('/^my-[0-9]{8}$/D', $values['service']) || !is_array($values['trunks']) || count($values['trunks']) === 0) {
 			throw new \RuntimeException('Activation state has an invalid service or trunk list.');
+		}
+		if (!is_int($values['max_channels']) || $values['max_channels'] < 1 || $values['max_channels'] > 500) {
+			throw new \RuntimeException('Activation state has an invalid channel entitlement.');
 		}
 		$values['trunks'] = $this->validateAuthorizedTrunks($values['trunks']);
 		if (!is_array($values['numbers']) || array_values($values['numbers']) !== $values['numbers']) {
@@ -551,7 +579,7 @@ class Domaintains implements \BMO {
 		$this->assertNoUnexpectedManagedTrunks($state['trunks']);
 		$outboundTrunkIds = [];
 		foreach ($state['trunks'] as $authorizedTrunk) {
-			$trunk = $this->reconcileTrunk($authorizedTrunk, $configurationChanged);
+			$trunk = $this->reconcileTrunk($authorizedTrunk, $state['max_channels'], $configurationChanged);
 			if ($trunk['changed']) {
 				$configurationChanged = true;
 			}
@@ -713,7 +741,7 @@ class Domaintains implements \BMO {
 		}
 	}
 
-	private function reconcileTrunk(array $authorizedTrunk, &$configurationChanged): array {
+	private function reconcileTrunk(array $authorizedTrunk, int $maxChannels, &$configurationChanged): array {
 		$core = $this->coreApi();
 		$trunkName = $this->resolvedManagedTrunkName($authorizedTrunk);
 		$trunks = $core->listTrunks();
@@ -729,22 +757,22 @@ class Domaintains implements \BMO {
 		if (count($matches) === 1) {
 			$trunk = $matches[0];
 			$id = isset($trunk['trunkid']) ? $trunk['trunkid'] : null;
-			if ($id !== null && !$this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk)) {
+			if ($id !== null && !$this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk, $maxChannels)) {
 				$details = $core->getTrunkDetails($id);
 				if (!$this->safeManagedTrunkUpgrade($trunk, $details)) {
 					throw new \RuntimeException('The module-owned trunk conflicts with the authorized configuration.');
 				}
-				$this->reconcileManagedTrunkInPlace($id, $trunk, $details, $authorizedTrunk);
+				$this->reconcileManagedTrunkInPlace($id, $trunk, $details, $authorizedTrunk, $maxChannels);
 				$configurationChanged = true;
 				$trunk = $this->findManagedTrunk($core, $authorizedTrunk);
 			}
-			if ($id === null || !$this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk)) {
+			if ($id === null || !$this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk, $maxChannels)) {
 				throw new \RuntimeException('The module-owned trunk conflicts with the authorized configuration.');
 			}
 			return ['id' => $id, 'changed' => false];
 		}
 
-		$settings = $this->desiredTrunkSettings($authorizedTrunk);
+		$settings = $this->desiredTrunkSettings($authorizedTrunk, $maxChannels);
 		if (!method_exists($core, 'checkPJSIPsettings')) {
 			throw new \RuntimeException('FreePBX PJSIP trunk API is unavailable.');
 		}
@@ -761,7 +789,7 @@ class Domaintains implements \BMO {
 		}
 		$configurationChanged = true;
 		$created = $this->findManagedTrunk($core, $authorizedTrunk);
-		if ($created === null || !$this->trunkMatchesAuthorizedState($created['trunkid'], $created, $authorizedTrunk)) {
+		if ($created === null || !$this->trunkMatchesAuthorizedState($created['trunkid'], $created, $authorizedTrunk, $maxChannels)) {
 			throw new \RuntimeException('The created PJSIP trunk did not verify.');
 		}
 		return ['id' => $created['trunkid'], 'changed' => true];
@@ -790,15 +818,15 @@ class Domaintains implements \BMO {
 			&& in_array(isset($details['authentication']) ? $details['authentication'] : '', ['', 'none', 'off'], true);
 	}
 
-	private function reconcileManagedTrunkInPlace($id, array $trunk, array $details, array $authorizedTrunk): void {
+	private function reconcileManagedTrunkInPlace($id, array $trunk, array $details, array $authorizedTrunk, int $maxChannels): void {
 		$core = $this->coreApi();
-		$settings = array_merge($trunk, $details, $this->desiredTrunkSettings($authorizedTrunk), [
+		$settings = array_merge($trunk, $details, $this->desiredTrunkSettings($authorizedTrunk, $maxChannels), [
 			'trunknum' => $id,
 			'disabletrunk' => $trunk['disabled'],
 			'failtrunk' => isset($trunk['failscript']) ? $trunk['failscript'] : '',
 			'outcid' => isset($trunk['outcid']) ? $trunk['outcid'] : '',
 			'keepcid' => isset($trunk['keepcid']) ? $trunk['keepcid'] : 'off',
-			'maxchans' => isset($trunk['maxchans']) ? $trunk['maxchans'] : '',
+			'maxchans' => (string)$maxChannels,
 			'continue' => isset($trunk['continue']) ? $trunk['continue'] : 'off',
 			'dialopts' => isset($trunk['dialopts']) ? $trunk['dialopts'] : false,
 			'md5_cred' => '',
@@ -819,7 +847,7 @@ class Domaintains implements \BMO {
 				throw new \RuntimeException('Unable to reconcile managed trunk in place.');
 			}
 			$updated = $this->findManagedTrunk($core, $authorizedTrunk);
-			if ($updated === null || !$this->trunkMatchesAuthorizedState($id, $updated, $authorizedTrunk) || !$database->commit()) {
+			if ($updated === null || !$this->trunkMatchesAuthorizedState($id, $updated, $authorizedTrunk, $maxChannels) || !$database->commit()) {
 				throw new \RuntimeException('Reconciled managed trunk failed verification.');
 			}
 		} catch (\Throwable $e) {
@@ -851,14 +879,14 @@ class Domaintains implements \BMO {
 		return isset($this->managedTrunkNames[$key]) ? $this->managedTrunkNames[$key] : $key;
 	}
 
-	private function desiredTrunkSettings(array $authorizedTrunk): array {
+	private function desiredTrunkSettings(array $authorizedTrunk, int $maxChannels): array {
 		$trunkName = $this->resolvedManagedTrunkName($authorizedTrunk);
 		return [
 			'channelid' => $trunkName,
 			'trunk_name' => $trunkName,
 			'outcid' => '',
 			'keepcid' => 'off',
-			'maxchans' => '',
+			'maxchans' => (string)$maxChannels,
 			'failtrunk' => '',
 			'dialoutprefix' => '',
 			'peerdetails' => '',
@@ -881,7 +909,7 @@ class Domaintains implements \BMO {
 		];
 	}
 
-	private function trunkMatchesAuthorizedState($trunkId, array $trunk, array $authorizedTrunk): bool {
+	private function trunkMatchesAuthorizedState($trunkId, array $trunk, array $authorizedTrunk, int $maxChannels): bool {
 		if (!isset($trunk['tech'], $trunk['disabled']) || strtolower((string)$trunk['tech']) !== 'pjsip' || strtolower((string)$trunk['disabled']) !== 'off') {
 			return false;
 		}
@@ -890,11 +918,14 @@ class Domaintains implements \BMO {
 		if (!is_array($details)) {
 			return false;
 		}
-		$expected = $this->desiredTrunkSettings($authorizedTrunk);
+		$expected = $this->desiredTrunkSettings($authorizedTrunk, $maxChannels);
 		foreach (['trunk_name', 'sip_server', 'context', 'sendrpid', 'authentication', 'registration'] as $field) {
 			if (!isset($details[$field]) || (string)$details[$field] !== (string)$expected[$field]) {
 				return false;
 			}
+		}
+		if (!isset($trunk['maxchans']) || (string)$trunk['maxchans'] !== (string)$maxChannels) {
+			return false;
 		}
 		if (!isset($details['sip_server_port']) || (int)$details['sip_server_port'] !== (int)$expected['sip_server_port']) {
 			return false;
@@ -1035,7 +1066,7 @@ class Domaintains implements \BMO {
 		$outboundTrunkIds = [];
 		foreach ($state['trunks'] as $authorizedTrunk) {
 			$trunk = $this->findManagedTrunk($core, $authorizedTrunk);
-			if ($trunk === null || !$this->trunkMatchesAuthorizedState($trunk['trunkid'], $trunk, $authorizedTrunk)) {
+			if ($trunk === null || !$this->trunkMatchesAuthorizedState($trunk['trunkid'], $trunk, $authorizedTrunk, $state['max_channels'])) {
 				throw new \RuntimeException('A local PJSIP trunk failed verification.');
 			}
 			if ($authorizedTrunk['role'] === 'outbound') {
