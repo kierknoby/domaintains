@@ -48,10 +48,10 @@ In plain terms:
 
 ## What Happens Later?
 
-When activation is run again to refresh the service, DOMAINTAINS uses the
-current provider-authorised configuration as the desired state for objects it
-owns. If someone manually changes a setting on a managed object, a later refresh
-may restore the authorised value. For example, a manually changed `maxchans`
+When Activate is run again with the existing activation authorization,
+DOMAINTAINS refreshes the provider-authorised configuration and reconciles
+module-owned objects. If someone manually changes a setting on a managed object,
+a later refresh may restore the authorised value. For example, a manually changed `maxchans`
 limit on a DOMAINTAINS trunk can be repaired from the provider-authorised channel
 limit.
 
@@ -78,6 +78,12 @@ reconciliation of its own service-related FreePBX configuration.
 - For that reason, commercial entitlement and upstream service limits must
   remain authoritative on the provider side.
 
+Local activation state and the persistent signing key are kept in protected
+Asterisk runtime storage. The directory is mode `0700`, and sensitive files are
+mode `0600`. Root `fwconsole` operations normalise ownership to the Asterisk
+runtime account so the FreePBX web runtime can read the same state. Atomic writes
+preserve these ownership and permission protections.
+
 The module requires PHP sodium and HTTPS support. To activate in FreePBX, open
 **Connectivity > DOMAINTAINS**, enter the token supplied by your provider, and
 select **Activate**. The CLI also supports activation:
@@ -94,6 +100,42 @@ fwconsole domaintains status
 fwconsole domaintains status --json
 ```
 
+### Deactivate or Reactivate
+
+To unlink local activation without removing the PBX signing identity, trunks,
+routes, numbers or other provisioned configuration:
+
+```sh
+fwconsole domaintains deactivate
+```
+
+Deactivation removes only the retained activation state. Status then reports
+`unprovisioned`; existing PBX configuration remains and calls may still work.
+It does not cancel a provider-side service or revoke upstream authorization.
+
+After Deactivate, use Activate to link the PBX again. Reactivate is only
+available while a valid retained activation authorization exists and is used to
+deliberately replace that authorization.
+
+To deliberately replace the activation authorization with a new token while
+keeping the existing signing identity:
+
+```sh
+fwconsole domaintains reactivate
+```
+
+Reactivation asks for confirmation and then securely prompts for the new token.
+It validates the provider response and reconciles configuration through the same
+path as activation. Ordinary `activate` still refuses a different token while
+retained activation state exists. Failed provider authorization leaves the
+previous state intact; local reconciliation failures retain the newly authorized
+state as pending for retry.
+
+Both lifecycle commands require interactive confirmation and refuse
+`--no-interaction`. The GUI offers confirmed Deactivate and Reactivate controls
+for valid retained activation state. Damaged or incompatible state is rejected,
+not silently discarded. These operations do not create a new signing identity.
+
 # For Developers and Service Providers
 
 This repository contains the PBX-side implementation. A compatible provisioning
@@ -103,7 +145,7 @@ public integration boundary; everything behind the service is implementation-
 specific.
 
 The project is under active development. The current module version is
-`0.3.4-dev`.
+`0.3.5-dev`.
 
 ## Architecture
 
@@ -164,9 +206,10 @@ The public activation lifecycle is:
 11. Later activation/refresh operations fetch current authorised state and repair
     module-owned drift.
 
-The module requires PHP sodium and HTTPS support. An activated installation
-cannot be linked to a different service identity through the module. The module
-does not retain the activation token in plaintext after activation.
+The module requires PHP sodium and HTTPS support. Ordinary activation preserves
+the retained activation identity; explicit reactivation permits replacement
+authorization using the same PBX signing identity and validated local service.
+The module does not retain the activation token in plaintext after activation.
 
 ## Signed Activation Claims
 
@@ -312,9 +355,10 @@ systems is required by the public module contract.
 
 ## Development and Testing
 
-The repository includes PHP contract tests for the module scaffold, activation
-and FreePBX compatibility. The activation tests use synthetic fixtures and API
-doubles rather than live provider infrastructure. Run the contracts with:
+The repository includes PHP contract tests for the module scaffold, activation,
+lifecycle/ownership and FreePBX compatibility. The activation tests use synthetic
+fixtures and API doubles rather than live provider infrastructure. Run the
+contracts with:
 
 ```sh
 for test in tests/*_contract.php; do php "$test" || exit 1; done

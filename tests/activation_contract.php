@@ -259,6 +259,10 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 		return $this->directory;
 	}
 
+	protected function storageOwner(): array {
+		return [posix_geteuid(), posix_getegid()];
+	}
+
 	protected function coreApi() {
 		return $this->core;
 	}
@@ -296,6 +300,9 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 		$keyPath = $this->directory . '/signing.key';
 		if (is_file($keyPath)) {
 			return ['synthetic-public-key', (string)file_get_contents($keyPath)];
+		}
+		if (!$allowCreate) {
+			throw new RuntimeException('Signing key is missing for retained activation state.');
 		}
 		if (file_put_contents($keyPath, 'synthetic-test-signing-key') === false || !chmod($keyPath, 0600)) {
 			throw new RuntimeException('Unable to create synthetic signing key.');
@@ -1096,6 +1103,78 @@ $diagnosticOutput = json_encode([$wrongSigningResult, $wrongKeyResult, $remoteRe
 foreach (array_merge(['synthetic-test-token', 'synthetic-test-signing-key', 'synthetic-signature', 'synthetic-secret', '/synthetic-private-path', 'raw-synthetic-response', '#0', 'RuntimeException', $directory], array_column($claims, 'signature'), array_map(function ($claim) { return $claim['claim']['nonce']; }, $claims)) as $sensitiveMarker) {
 	activation_assert(strpos($diagnosticOutput, $sensitiveMarker) === false, 'refresh diagnostics must not contain secrets or request material');
 }
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$lifecycleModule = new ActivationContractModule($directory, [activation_fixture_response()]);
+activation_assert($lifecycleModule->activate('synthetic-test-token')['success'], 'lifecycle fixture should provision');
+$lifecycleCore = $lifecycleModule->coreFixture();
+$lifecycleRouting = $lifecycleModule->routingFixture();
+$preservedKey = file_get_contents($directory . '/signing.key');
+$preservedMarker = file_get_contents($directory . '/test-destination.json');
+$stateBeforeReplacement = file_get_contents($directory . '/state.json');
+$mismatchedSigningState = json_decode($stateBeforeReplacement, true);
+$mismatchedSigningState['public_key_fingerprint'] = hash('sha256', 'synthetic-other-signing-identity');
+file_put_contents($directory . '/state.json', json_encode($mismatchedSigningState));
+activation_assert(!$lifecycleModule->reactivate('synthetic-replacement-token')['success'] && count($lifecycleModule->requests()) === 1, 'explicit replacement must still enforce retained signing identity');
+file_put_contents($directory . '/state.json', $stateBeforeReplacement);
+activation_assert(!$lifecycleModule->activate('synthetic-replacement-token')['success'] && count($lifecycleModule->requests()) === 1, 'ordinary activation must not replace retained activation identity');
+$lifecycleModule->remoteException = new RuntimeException('synthetic-private-reason');
+activation_assert(!$lifecycleModule->reactivate('synthetic-replacement-token')['success'], 'provider failure must reject replacement');
+activation_assert(file_get_contents($directory . '/state.json') === $stateBeforeReplacement, 'failed remote replacement must preserve previous state');
+$lifecycleModule->remoteException = null;
+$lifecycleModule->queueResponse(activation_fixture_response(['max_channels' => 10]));
+activation_assert($lifecycleModule->reactivate('synthetic-replacement-token')['success'], 'explicit reactivation should replace activation identity');
+$replacementState = json_decode(file_get_contents($directory . '/state.json'), true);
+activation_assert($replacementState['activation_key_fingerprint'] !== json_decode($stateBeforeReplacement, true)['activation_key_fingerprint'], 'reactivation must persist the new activation-key identity');
+activation_assert($replacementState['max_channels'] === 10 && $lifecycleCore->trunks[0]['maxchans'] === '10', 'reactivation should reconcile newly authorized state');
+activation_assert(file_get_contents($directory . '/signing.key') === $preservedKey, 'reactivation must retain the signing key');
+$lifecycleClaims = array_map(function ($request) { return json_decode($request, true)['claim']; }, $lifecycleModule->requests());
+activation_assert($lifecycleClaims[0]['public_key'] === $lifecycleClaims[2]['public_key'], 'explicit replacement must sign with the existing public identity');
+$configurationBeforeDeactivate = [$lifecycleCore->trunks, $lifecycleCore->details, $lifecycleCore->dids, $lifecycleRouting->routes, $lifecycleRouting->patterns, $lifecycleRouting->trunks];
+$reloadsBeforeDeactivate = $lifecycleModule->reloadRequests;
+activation_assert($lifecycleModule->deactivate()['success'], 'deactivation should unlink valid state');
+activation_assert(!file_exists($directory . '/state.json') && file_get_contents($directory . '/signing.key') === $preservedKey, 'deactivation removes only state and retains signing identity');
+activation_assert([$lifecycleCore->trunks, $lifecycleCore->details, $lifecycleCore->dids, $lifecycleRouting->routes, $lifecycleRouting->patterns, $lifecycleRouting->trunks] === $configurationBeforeDeactivate, 'deactivation must preserve managed PBX configuration');
+activation_assert(file_get_contents($directory . '/test-destination.json') === $preservedMarker && $lifecycleModule->reloadRequests === $reloadsBeforeDeactivate, 'deactivation must preserve test registration and not reload');
+activation_assert($lifecycleModule->getStatus()['state'] === 'unprovisioned' && !$lifecycleModule->getStatus()['provisioned'], 'deactivation status must be unprovisioned');
+activation_assert($lifecycleModule->deactivate()['success'], 'deactivating already unlinked state should be idempotent');
+$requestsAfterDeactivate = count($lifecycleModule->requests());
+$reactivationAfterDeactivate = $lifecycleModule->reactivate('synthetic-third-token');
+activation_assert(!$reactivationAfterDeactivate['success'] && $reactivationAfterDeactivate['stage'] === 'local', 'reactivation must require an existing retained activation authorization');
+activation_assert(count($lifecycleModule->requests()) === $requestsAfterDeactivate && !file_exists($directory . '/state.json') && file_get_contents($directory . '/signing.key') === $preservedKey, 'reactivation after deactivation must not send a request, create state or change signing identity');
+$lifecycleModule->queueResponse(activation_fixture_response(['max_channels' => 10]));
+activation_assert($lifecycleModule->activate('synthetic-third-token')['success'] && file_get_contents($directory . '/signing.key') === $preservedKey, 'activation after deactivation must accept a new token while preserving signing identity');
+activation_assert(json_decode($lifecycleModule->requests()[$requestsAfterDeactivate], true)['claim']['public_key'] === $lifecycleClaims[0]['public_key'], 'normal activation after deactivation must retain the original public signing identity');
+activation_assert($lifecycleModule->getStatus()['state'] === 'provisioned', 'subsequent activation should restore provisioned status');
+file_put_contents($directory . '/state.json', '{malformed');
+$requestCount = count($lifecycleModule->requests());
+activation_assert(!$lifecycleModule->deactivate()['success'] && !$lifecycleModule->reactivate('synthetic-fourth-token')['success'], 'malformed state must not be removed or replaced through lifecycle operations');
+activation_assert(file_get_contents($directory . '/state.json') === '{malformed' && count($lifecycleModule->requests()) === $requestCount && $lifecycleModule->getStatus()['state'] === 'error', 'malformed state remains unchanged and sends no request');
+unlink($directory . '/state.json');
+symlink($directory . '/signing.key', $directory . '/state.json');
+activation_assert(!$lifecycleModule->deactivate()['success'] && !$lifecycleModule->reactivate('synthetic-fourth-token')['success'] && is_link($directory . '/state.json'), 'symlinked state must fail closed');
+activation_assert(file_get_contents($directory . '/signing.key') === $preservedKey, 'symlink rejection must preserve signing key target');
+unlink($directory . '/state.json');
+mkdir($directory . '/state.json');
+activation_assert(!$lifecycleModule->deactivate()['success'] && !$lifecycleModule->reactivate('synthetic-fourth-token')['success'], 'non-regular state must fail closed');
+rmdir($directory . '/state.json');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$pendingReplacement = new ActivationContractModule($directory, [activation_fixture_response()]);
+activation_assert($pendingReplacement->activate('synthetic-test-token')['success'], 'pending replacement fixture must provision');
+$pendingReplacement->failDialplanVerification = true;
+activation_assert(!$pendingReplacement->reactivate('synthetic-replacement-token')['success'], 'local failure after authorized replacement must remain pending');
+$pendingReplacementState = json_decode(file_get_contents($directory . '/state.json'), true);
+activation_assert(!$pendingReplacementState['provisioned'] && $pendingReplacementState['last_error_stage'] === 'local', 'authorized replacement must retain safe pending status on local failure');
+$pendingReplacement->failDialplanVerification = false;
+activation_assert(!$pendingReplacement->activate('synthetic-test-token')['success'] && $pendingReplacement->activate('synthetic-replacement-token')['success'], 'pending replacement must reject the old key and retry with the new key');
+activation_cleanup($directory);
+
+$directory = activation_temp_directory();
+$missingIdentityModule = new ActivationContractModule($directory, []);
+activation_assert(!$missingIdentityModule->reactivate('synthetic-test-token')['success'] && $missingIdentityModule->requests() === [] && !file_exists($directory . '/signing.key'), 'reactivation must not generate a replacement signing identity');
 activation_cleanup($directory);
 
 echo "Activation contract passed.\n";

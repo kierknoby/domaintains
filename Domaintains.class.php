@@ -13,7 +13,7 @@ namespace FreePBX\modules;
 class Domaintains implements \BMO {
 
 	/** Fallback only. Authoritative version lives in module.xml. */
-	const VERSION = '0.3.4-dev';
+	const VERSION = '0.3.5-dev';
 	const ACTIVATION_ENDPOINT = 'https://my-connect.freepbxhosting.uk/activate';
 	const TRUNK_NAME = 'DOMAINTAINS';
 	const ROUTE_NAME = 'DOMAINTAINS-Outbound';
@@ -35,7 +35,7 @@ class Domaintains implements \BMO {
 	public function backup(): array { return []; }
 	public function restore($backup): void {}
 	public function doConfigPageInit($page): void {
-		if (!isset($_SERVER['REQUEST_METHOD']) || strtoupper($_SERVER['REQUEST_METHOD']) !== 'POST' || !isset($_POST['domaintains_action']) || $_POST['domaintains_action'] !== 'activate') {
+		if (!isset($_SERVER['REQUEST_METHOD']) || strtoupper($_SERVER['REQUEST_METHOD']) !== 'POST' || !isset($_POST['domaintains_action']) || !in_array($_POST['domaintains_action'], ['activate', 'deactivate', 'reactivate'], true)) {
 			return;
 		}
 
@@ -47,8 +47,13 @@ class Domaintains implements \BMO {
 		}
 
 		unset($_SESSION['domaintains_csrf']);
+		$action = $_POST['domaintains_action'];
+		if ($action !== 'activate' && (!isset($_POST['domaintains_confirm']) || $_POST['domaintains_confirm'] !== 'yes')) {
+			$this->setGuiMessage(false, _('Confirm the requested lifecycle operation.'));
+			return;
+		}
 		$key = isset($_POST['activation_key']) ? trim((string)$_POST['activation_key']) : '';
-		$result = $this->activate($key);
+		$result = $action === 'deactivate' ? $this->deactivate() : ($action === 'reactivate' ? $this->reactivate($key) : $this->activate($key));
 		$this->setGuiMessage($result['success'], $result['message']);
 	}
 
@@ -113,6 +118,55 @@ class Domaintains implements \BMO {
 
 	/** Activate this installation using the provider-issued key. */
 	public function activate(string $activationKey): array {
+		return $this->performActivation($activationKey, false);
+	}
+
+	public function reactivate(string $activationKey): array {
+		return $this->performActivation($activationKey, true);
+	}
+
+	public function deactivate(): array {
+		$lock = null;
+		try {
+			$lock = $this->lockActivationState();
+			if ($this->readActivationState() !== null && !@unlink($this->storageDirectory() . '/state.json')) {
+				throw new \RuntimeException('Unable to remove activation state.');
+			}
+			return ['success' => true, 'message' => _('DOMAINTAINS deactivated. Signing identity and PBX configuration preserved.')];
+		} catch (\Throwable $e) {
+			return ['success' => false, 'message' => _('Unable to deactivate DOMAINTAINS safely. Retained state requires attention.'), 'stage' => 'local-state'];
+		} finally {
+			if (is_resource($lock)) {
+				flock($lock, LOCK_UN);
+				fclose($lock);
+			}
+		}
+	}
+
+	private function lockActivationState() {
+		$this->ensureStorageDirectory();
+		$lockPath = $this->storageDirectory() . '/activation.lock';
+		if (is_link($lockPath) || (file_exists($lockPath) && !is_file($lockPath))) {
+			throw new \RuntimeException('Invalid activation lock.');
+		}
+		$lock = fopen($lockPath, 'c');
+		if ($lock === false) {
+			throw new \RuntimeException('Unable to open activation lock.');
+		}
+		try {
+			$this->secureStoragePath($lockPath, 0600);
+		} catch (\Throwable $e) {
+			fclose($lock);
+			throw $e;
+		}
+		if (!flock($lock, LOCK_EX)) {
+			fclose($lock);
+			throw new \RuntimeException('Unable to lock activation state.');
+		}
+		return $lock;
+	}
+
+	private function performActivation(string $activationKey, bool $replaceActivationIdentity): array {
 		if (trim($activationKey) === '') {
 			return ['success' => false, 'message' => _('Enter an activation key.'), 'stage' => 'remote'];
 		}
@@ -125,24 +179,13 @@ class Domaintains implements \BMO {
 		$configurationChanged = false;
 		$reloadRequested = false;
 		try {
-			$this->ensureStorageDirectory();
-			$lockPath = $this->storageDirectory() . '/activation.lock';
-			if (is_link($lockPath)) {
-				throw new \RuntimeException('Invalid activation lock.');
-			}
-			$lock = fopen($lockPath, 'c');
-			if ($lock === false) {
-				throw new \RuntimeException('Unable to open activation lock.');
-			}
-			if (!chmod($lockPath, 0600)) {
-				throw new \RuntimeException('Unable to secure activation lock.');
-			}
-			if (!flock($lock, LOCK_EX)) {
-				throw new \RuntimeException('Unable to lock activation state.');
-			}
+			$lock = $this->lockActivationState();
 
 			$stage = 'local-state';
 			$existingState = $this->readActivationState();
+			if ($replaceActivationIdentity && $existingState === null) {
+				return ['success' => false, 'message' => _('No retained activation authorization exists. Use Activate instead.'), 'stage' => 'local'];
+			}
 			if ($existingState !== null) {
 				$stage = 'local';
 				$state = array_merge($this->authorizedValues($existingState), [
@@ -158,14 +201,14 @@ class Domaintains implements \BMO {
 			if (!$this->supportsHttpsTransport()) {
 				return ['success' => false, 'message' => _('Activation is unavailable because HTTPS support is missing.'), 'stage' => 'remote'];
 			}
-			list($publicKey, $secretKey) = $this->loadOrCreateSigningKeypair($existingState === null);
+			list($publicKey, $secretKey) = $this->loadOrCreateSigningKeypair($existingState === null && !$replaceActivationIdentity);
 			$publicKeyFingerprint = hash('sha256', $publicKey);
 			$activationKeyFingerprint = $this->activationKeyFingerprint($activationKey, $secretKey);
 			if ($existingState !== null) {
 				if (!hash_equals($existingState->public_key_fingerprint, $publicKeyFingerprint)) {
 					return ['success' => false, 'message' => _('The local signing identity does not match the pending activation state.'), 'stage' => 'local'];
 				}
-				if (!hash_equals($existingState->activation_key_fingerprint, $activationKeyFingerprint)) {
+				if (!$replaceActivationIdentity && !hash_equals($existingState->activation_key_fingerprint, $activationKeyFingerprint)) {
 					return ['success' => false, 'message' => _('This installation is already linked to a different activation identity.'), 'stage' => 'local'];
 				}
 			}
@@ -306,8 +349,31 @@ class Domaintains implements \BMO {
 		if (!is_dir($directory) && !mkdir($directory, 0700, true) && !is_dir($directory)) {
 			throw new \RuntimeException('Unable to create activation storage.');
 		}
-		if (!chmod($directory, 0700)) {
-			throw new \RuntimeException('Unable to secure activation storage.');
+		$this->secureStoragePath($directory, 0700, true);
+	}
+
+	protected function storageOwner(): array {
+		$account = function_exists('posix_getpwnam') ? posix_getpwnam('asterisk') : false;
+		if (!is_array($account) || !isset($account['uid'], $account['gid'])) {
+			throw new \RuntimeException('Unable to determine secure storage ownership.');
+		}
+		return [(int)$account['uid'], (int)$account['gid']];
+	}
+
+	private function secureStoragePath(string $path, int $mode, bool $directory = false): void {
+		if (is_link($path) || ($directory ? !is_dir($path) : !is_file($path))) {
+			throw new \RuntimeException('Invalid secure storage path.');
+		}
+		list($owner, $group) = $this->storageOwner();
+		clearstatcache(true, $path);
+		if (!@chmod($path, $mode)
+			|| (fileowner($path) !== $owner && !@chown($path, $owner))
+			|| (filegroup($path) !== $group && !@chgrp($path, $group))) {
+			throw new \RuntimeException('Unable to secure storage ownership.');
+		}
+		clearstatcache(true, $path);
+		if (fileowner($path) !== $owner || filegroup($path) !== $group || (fileperms($path) & 0777) !== $mode) {
+			throw new \RuntimeException('Secure storage ownership failed verification.');
 		}
 	}
 
@@ -317,9 +383,7 @@ class Domaintains implements \BMO {
 			if (is_link($path) || !is_file($path)) {
 				throw new \RuntimeException('Invalid signing key file.');
 			}
-			if (!chmod($path, 0600)) {
-				throw new \RuntimeException('Unable to secure signing key file.');
-			}
+			$this->secureStoragePath($path, 0600);
 			$secretKey = @file_get_contents($path);
 			if (!is_string($secretKey) || strlen($secretKey) !== SODIUM_CRYPTO_SIGN_SECRETKEYBYTES) {
 				throw new \RuntimeException('Invalid signing key file.');
@@ -347,9 +411,7 @@ class Domaintains implements \BMO {
 		if (is_link($path) || !is_file($path)) {
 			throw new \RuntimeException('Invalid activation state file.');
 		}
-		if (!chmod($path, 0600)) {
-			throw new \RuntimeException('Unable to secure activation state file.');
-		}
+		$this->secureStoragePath($path, 0600);
 		$contents = @file_get_contents($path);
 		$record = is_string($contents) ? json_decode($contents) : null;
 		if (!is_object($record) || !isset($record->provisioned, $record->activated_at, $record->public_key_fingerprint, $record->activation_key_fingerprint) || !is_bool($record->provisioned) || !is_int($record->activated_at) || !preg_match('/^[a-f0-9]{64}$/', (string)$record->public_key_fingerprint) || !preg_match('/^[a-f0-9]{64}$/', (string)$record->activation_key_fingerprint)) {
@@ -1094,13 +1156,17 @@ class Domaintains implements \BMO {
 	}
 
 	private function writeSecureFile(string $path, string $contents): void {
+		if (is_link($path) || (file_exists($path) && !is_file($path))) {
+			throw new \RuntimeException('Invalid secure storage path.');
+		}
 		$temporaryPath = $path . '.' . bin2hex(random_bytes(8)) . '.tmp';
 		$handle = @fopen($temporaryPath, 'x');
 		if ($handle === false) {
 			throw new \RuntimeException('Unable to create secure file.');
 		}
 		try {
-			if (!chmod($temporaryPath, 0600) || fwrite($handle, $contents) !== strlen($contents) || !fflush($handle)) {
+			$this->secureStoragePath($temporaryPath, 0600);
+			if (fwrite($handle, $contents) !== strlen($contents) || !fflush($handle)) {
 				throw new \RuntimeException('Unable to write secure file.');
 			}
 		} catch (\Throwable $e) {

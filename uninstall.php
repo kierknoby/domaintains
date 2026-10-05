@@ -2,5 +2,5 @@
 /**
  * DOMAINTAINS uninstall hook.
  *
- * Version 0.3.4-dev has no schema migrations or scheduled jobs to remove.
+ * Version 0.3.5-dev has no schema migrations or scheduled jobs to remove.
  */

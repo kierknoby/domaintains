@@ -97,4 +97,28 @@ $activationMessage = isset($activationMessage) && is_array($activationMessage) ?
 			</div>
 		</div>
 	<?php endif; ?>
+
+	<?php if (in_array($state, ['provisioned', 'pending'], true)): ?>
+		<div class="row">
+			<div class="col-md-8">
+				<form method="post" autocomplete="off">
+					<input type="hidden" name="domaintains_action" value="reactivate">
+					<input type="hidden" name="domaintains_csrf" value="<?php echo htmlspecialchars($activationCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
+					<div class="form-group">
+						<label for="reactivation-key"><?php echo _('New activation key'); ?></label>
+						<input type="password" id="reactivation-key" name="activation_key" class="form-control" required autocomplete="new-password">
+					</div>
+					<div class="checkbox"><label><input type="checkbox" name="domaintains_confirm" value="yes" required> <?php echo _('Confirm replacement of activation authorization using the existing signing identity.'); ?></label></div>
+					<button type="submit" class="btn btn-primary"><?php echo _('Reactivate'); ?></button>
+				</form>
+				<hr>
+				<form method="post">
+					<input type="hidden" name="domaintains_action" value="deactivate">
+					<input type="hidden" name="domaintains_csrf" value="<?php echo htmlspecialchars($activationCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
+					<div class="checkbox"><label><input type="checkbox" name="domaintains_confirm" value="yes" required> <?php echo _('Confirm unlinking activation. Signing identity and PBX configuration will remain.'); ?></label></div>
+					<button type="submit" class="btn btn-danger"><?php echo _('Deactivate'); ?></button>
+				</form>
+			</div>
+		</div>
+	<?php endif; ?>
 </div>
