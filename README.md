@@ -1,5 +1,7 @@
 # DOMAINTAINS
 
+⚠️ Not currently suitable for use in production
+
 DOMAINTAINS is a community module for FreePBX 16 and 17. It lets an authorised
 communications provider deliver and maintain the FreePBX configuration
 associated with a service.
