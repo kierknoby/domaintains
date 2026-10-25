@@ -17,6 +17,7 @@ $state = isset($status['state']) ? (string)$status['state'] : 'unknown';
 $stateLabel = $state === 'unprovisioned' ? _('Not activated') : ucfirst($state);
 $activationCsrfToken = isset($activationCsrfToken) ? (string)$activationCsrfToken : '';
 $activationMessage = isset($activationMessage) && is_array($activationMessage) ? $activationMessage : [];
+$provisioningEndpoint = isset($provisioningEndpoint) ? (string)$provisioningEndpoint : '';
 ?>
 <div class="fpbx-container">
 	<div class="row">
@@ -97,6 +98,20 @@ $activationMessage = isset($activationMessage) && is_array($activationMessage) ?
 			</div>
 		</div>
 	<?php endif; ?>
+
+	<div class="row">
+		<div class="col-md-8">
+			<form method="post" autocomplete="off">
+				<input type="hidden" name="domaintains_action" value="endpoint">
+				<input type="hidden" name="domaintains_csrf" value="<?php echo htmlspecialchars($activationCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
+				<div class="form-group">
+					<label for="provisioning-endpoint"><?php echo _('Provisioning endpoint (complete HTTPS URL)'); ?></label>
+					<input type="url" id="provisioning-endpoint" name="provisioning_endpoint" class="form-control" required value="<?php echo htmlspecialchars($provisioningEndpoint, ENT_QUOTES, 'UTF-8'); ?>">
+				</div>
+				<button type="submit" class="btn btn-default"><?php echo _('Save provisioning endpoint'); ?></button>
+			</form>
+		</div>
+	</div>
 
 	<?php if (in_array($state, ['provisioned', 'pending'], true)): ?>
 		<div class="row">

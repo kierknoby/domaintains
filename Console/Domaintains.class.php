@@ -21,7 +21,8 @@ class Domaintains extends Command {
 	protected function configure() {
 		$this->setName('domaintains')
 			->setDescription('Activate DOMAINTAINS and inspect local activation status')
-			->addArgument('action', InputArgument::OPTIONAL, 'Action: status, activate, deactivate or reactivate', 'status')
+			->addArgument('action', InputArgument::OPTIONAL, 'Action: status, activate, deactivate, reactivate, endpoint or adopt', 'status')
+			->addArgument('value', InputArgument::OPTIONAL, 'Complete HTTPS provisioning endpoint (endpoint action only)', null)
 			->addOption('json', null, InputOption::VALUE_NONE, 'Return machine-readable JSON');
 	}
 
@@ -29,6 +30,39 @@ class Domaintains extends Command {
 		$action = strtolower(trim((string)$input->getArgument('action')));
 		if ($action === '') {
 			$action = 'status';
+		}
+		if ($action === 'endpoint') {
+			$value = $input->getArgument('value');
+			if ($value !== null) {
+				return $this->outputResult(\FreePBX::Domaintains()->configureProvisioningEndpoint((string)$value), $input, $output);
+			}
+			try {
+				$endpoint = \FreePBX::Domaintains()->getProvisioningEndpoint();
+				$output->writeln($input->getOption('json') ? json_encode(['endpoint' => $endpoint], JSON_UNESCAPED_SLASHES) : ($endpoint === '' ? 'No provisioning endpoint configured.' : $endpoint));
+				return 0;
+			} catch (\Throwable $e) {
+				return $this->outputResult(['success' => false, 'message' => 'Unable to read provisioning endpoint safely.'], $input, $output);
+			}
+		}
+		if ($action === 'adopt') {
+			if (!$input->isInteractive()) {
+				return $this->outputResult(['success' => false, 'message' => 'Ownership adoption requires interactive review and confirmation.'], $input, $output);
+			}
+			$preview = \FreePBX::Domaintains()->previewOwnershipAdoption();
+			if (!$preview['success']) {
+				return $this->outputResult($preview, $input, $output);
+			}
+			$promptOutput = $input->getOption('json') && method_exists($output, 'getErrorOutput') ? $output->getErrorOutput() : $output;
+			$promptOutput->writeln('Exact matching objects proposed for ownership adoption:');
+			foreach ($preview['objects'] as $object) {
+				$promptOutput->writeln(json_encode(['type' => $object['type'], 'id' => $object['id'], 'label' => $object['label'], 'current_state' => isset($object['current_state']) ? $object['current_state'] : null, 'already_owned' => $object['owned']], JSON_UNESCAPED_SLASHES));
+			}
+			try {
+				$confirmed = $this->getHelper('question')->ask($input, $promptOutput, new ConfirmationQuestion('Adopt these exact objects as DOMAINTAINS-owned? [y/N] ', false));
+			} catch (\RuntimeException $e) {
+				$confirmed = false;
+			}
+			return $this->outputResult(\FreePBX::Domaintains()->adoptOwnership($preview['plan'], $confirmed === true), $input, $output);
 		}
 
 		if (in_array($action, ['deactivate', 'reactivate'], true)) {
@@ -81,7 +115,7 @@ class Domaintains extends Command {
 		}
 
 		if ($action !== 'status') {
-			$output->writeln('<error>Unknown action. Use status, activate, deactivate or reactivate.</error>');
+			$output->writeln('<error>Unknown action. Use status, activate, deactivate, reactivate, endpoint or adopt.</error>');
 			return 1;
 		}
 

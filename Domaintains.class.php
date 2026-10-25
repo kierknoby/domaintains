@@ -13,8 +13,7 @@ namespace FreePBX\modules;
 class Domaintains implements \BMO {
 
 	/** Fallback only. Authoritative version lives in module.xml. */
-	const VERSION = '0.3.5-dev';
-	const ACTIVATION_ENDPOINT = 'https://my-connect.freepbxhosting.uk/activate';
+	const VERSION = '0.4.0-dev';
 	const TRUNK_NAME = 'DOMAINTAINS';
 	const ROUTE_NAME = 'DOMAINTAINS-Outbound';
 	const TEST_DESTINATION = 'domaintains-test,s,1';
@@ -35,7 +34,7 @@ class Domaintains implements \BMO {
 	public function backup(): array { return []; }
 	public function restore($backup): void {}
 	public function doConfigPageInit($page): void {
-		if (!isset($_SERVER['REQUEST_METHOD']) || strtoupper($_SERVER['REQUEST_METHOD']) !== 'POST' || !isset($_POST['domaintains_action']) || !in_array($_POST['domaintains_action'], ['activate', 'deactivate', 'reactivate'], true)) {
+		if (!isset($_SERVER['REQUEST_METHOD']) || strtoupper($_SERVER['REQUEST_METHOD']) !== 'POST' || !isset($_POST['domaintains_action']) || !in_array($_POST['domaintains_action'], ['activate', 'deactivate', 'reactivate', 'endpoint'], true)) {
 			return;
 		}
 
@@ -48,6 +47,11 @@ class Domaintains implements \BMO {
 
 		unset($_SESSION['domaintains_csrf']);
 		$action = $_POST['domaintains_action'];
+		if ($action === 'endpoint') {
+			$result = $this->configureProvisioningEndpoint(isset($_POST['provisioning_endpoint']) && is_string($_POST['provisioning_endpoint']) ? $_POST['provisioning_endpoint'] : '');
+			$this->setGuiMessage($result['success'], $result['message']);
+			return;
+		}
 		if ($action !== 'activate' && (!isset($_POST['domaintains_confirm']) || $_POST['domaintains_confirm'] !== 'yes')) {
 			$this->setGuiMessage(false, _('Confirm the requested lifecycle operation.'));
 			return;
@@ -82,6 +86,7 @@ class Domaintains implements \BMO {
 		$provisioned = false;
 		$activatedAt = null;
 		try {
+			$this->readOwnershipState();
 			$record = $this->readActivationState();
 			if ($record !== null) {
 				$provisioned = $record->provisioned;
@@ -129,6 +134,7 @@ class Domaintains implements \BMO {
 		$lock = null;
 		try {
 			$lock = $this->lockActivationState();
+			$this->readOwnershipState();
 			if ($this->readActivationState() !== null && !@unlink($this->storageDirectory() . '/state.json')) {
 				throw new \RuntimeException('Unable to remove activation state.');
 			}
@@ -182,9 +188,13 @@ class Domaintains implements \BMO {
 			$lock = $this->lockActivationState();
 
 			$stage = 'local-state';
+			$this->readOwnershipState();
 			$existingState = $this->readActivationState();
 			if ($replaceActivationIdentity && $existingState === null) {
 				return ['success' => false, 'message' => _('No retained activation authorization exists. Use Activate instead.'), 'stage' => 'local'];
+			}
+			if ($this->getProvisioningEndpoint() === '') {
+				return ['success' => false, 'message' => _('Configure a provisioning endpoint before Activate or Reactivate.'), 'stage' => 'local-state'];
 			}
 			if ($existingState !== null) {
 				$stage = 'local';
@@ -197,7 +207,6 @@ class Domaintains implements \BMO {
 			}
 			$stage = 'local';
 			$localService = $this->validatedLocalServiceIdentity();
-			$this->ensureActivationHostInLocalZone();
 			if (!$this->supportsHttpsTransport()) {
 				return ['success' => false, 'message' => _('Activation is unavailable because HTTPS support is missing.'), 'stage' => 'remote'];
 			}
@@ -275,8 +284,14 @@ class Domaintains implements \BMO {
 	}
 
 	public function showPage(): string {
+		try {
+			$endpoint = $this->getProvisioningEndpoint();
+		} catch (\Throwable $e) {
+			$endpoint = '';
+		}
 		return load_view(__DIR__ . '/views/main.php', [
 			'moduleVersion' => $this->getVersion(),
+			'provisioningEndpoint' => $endpoint,
 			'status' => $this->getStatus(),
 			'activationCsrfToken' => $this->createSessionCsrfToken(),
 			'activationMessage' => $this->takeGuiMessage(),
@@ -333,12 +348,194 @@ class Domaintains implements \BMO {
 			'Unexpected managed trunk role or identity.',
 			'Unable to reconcile managed trunk in place.',
 			'Reconciled managed trunk failed verification.',
+			'The prior trunk configuration could not be restored and verified. Reconciliation stopped; administrator review is required.',
+			'Owned trunk configuration no longer matches its recorded fingerprint. Reconciliation refused.',
+			'Explicit ownership adoption is required before DOMAINTAINS may modify this existing trunk. Run fwconsole domaintains adopt, review and confirm, then retry activation.',
 		];
 		return in_array($message, $safeMessages, true) ? $message : 'Local DOMAINTAINS reconciliation failed.';
 	}
 
 	protected function storageDirectory(): string {
 		return '/var/lib/asterisk/domaintains';
+	}
+
+	private function readOwnershipState(): array {
+		$value = $this->readProtectedJson('ownership.json');
+		if ($value === null) {
+			return ['version' => 1, 'objects' => []];
+		}
+		if (array_keys($value) !== ['version', 'objects'] || $value['version'] !== 1
+			|| !is_array($value['objects']) || array_values($value['objects']) !== $value['objects']) {
+			throw new \RuntimeException('Invalid object ownership state.');
+		}
+		$seen = [];
+		foreach ($value['objects'] as $entry) {
+			if (!is_array($entry) || !in_array(array_keys($entry), [
+				['type', 'id', 'fingerprint', 'recorded_at', 'origin'],
+				['type', 'id', 'fingerprint', 'recorded_at', 'origin', 'pending_fingerprint'],
+			], true)
+				|| !is_string($entry['type']) || !in_array($entry['type'], ['trunk', 'inbound', 'outbound', 'test_destination'], true)
+				|| !is_array($entry['id']) || !is_string($entry['fingerprint']) || !preg_match('/^[a-f0-9]{64}$/D', $entry['fingerprint'])
+				|| !is_int($entry['recorded_at']) || $entry['recorded_at'] < 1 || !in_array($entry['origin'], ['created', 'adopted'], true)) {
+				throw new \RuntimeException('Invalid object ownership entry.');
+			}
+			if (array_key_exists('pending_fingerprint', $entry) && ($entry['type'] !== 'trunk'
+				|| !is_string($entry['pending_fingerprint']) || !preg_match('/^[a-f0-9]{64}$/D', $entry['pending_fingerprint']))) {
+				throw new \RuntimeException('Invalid pending trunk fingerprint.');
+			}
+			$keys = $entry['type'] === 'inbound' ? ['extension', 'cidnum'] : ['id'];
+			if (array_keys($entry['id']) !== $keys) {
+				throw new \RuntimeException('Invalid native object identity.');
+			}
+			foreach ($entry['id'] as $field => $identifier) {
+				if (!is_string($identifier) || ($field !== 'cidnum' && $identifier === '') || preg_match('/[\x00-\x1f\x7f]/', $identifier)) {
+					throw new \RuntimeException('Invalid native object identity.');
+				}
+			}
+			if ($entry['type'] === 'test_destination' && $entry['id'] !== ['id' => self::TEST_DESTINATION]) {
+				throw new \RuntimeException('Invalid test destination identity.');
+			}
+			$key = $this->ownershipKey($entry['type'], $entry['id']);
+			if (isset($seen[$key])) {
+				throw new \RuntimeException('Duplicate ownership identity.');
+			}
+			$seen[$key] = true;
+		}
+		return $value;
+	}
+
+	private function ownershipKey(string $type, array $id): string {
+		return $type . ':' . json_encode($id, JSON_UNESCAPED_SLASHES);
+	}
+
+	private function ownershipFingerprintMatches(array $entry, string $fingerprint): bool {
+		return hash_equals($entry['fingerprint'], $fingerprint)
+			|| (isset($entry['pending_fingerprint']) && hash_equals($entry['pending_fingerprint'], $fingerprint));
+	}
+
+	private function ownsObject(string $type, array $id): bool {
+		$key = $this->ownershipKey($type, $id);
+		$ledger = $this->readOwnershipState();
+		foreach ($ledger['objects'] as $index => $entry) {
+			if ($this->ownershipKey($entry['type'], $entry['id']) === $key) {
+				$configuration = $this->ownedObjectConfiguration($entry);
+				$fingerprint = $configuration === null ? '' : $this->configurationFingerprint($configuration);
+				if (!$this->ownershipFingerprintMatches($entry, $fingerprint)) {
+					throw new \RuntimeException('Owned trunk configuration no longer matches its recorded fingerprint. Reconciliation refused.');
+				}
+				if (isset($entry['pending_fingerprint'])) {
+					$ledger['objects'][$index]['fingerprint'] = $fingerprint;
+					unset($ledger['objects'][$index]['pending_fingerprint']);
+					$this->writeProtectedJson('ownership.json', $ledger);
+				}
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private function configurationFingerprint(array $configuration): string {
+		$normalize = function ($value) use (&$normalize) {
+			if (!is_array($value)) {
+				return $value === null ? null : (string)$value;
+			}
+			if (array_values($value) !== $value) {
+				ksort($value);
+			}
+			return array_map($normalize, $value);
+		};
+		$encoded = json_encode($normalize($configuration), JSON_UNESCAPED_SLASHES);
+		if ($encoded === false) {
+			throw new \RuntimeException('Unable to fingerprint managed object.');
+		}
+		return hash('sha256', $encoded);
+	}
+
+	private function recordOwnedObject(string $type, array $id, array $configuration, bool $created): void {
+		$ledger = $this->readOwnershipState();
+		$key = $this->ownershipKey($type, $id);
+		foreach ($ledger['objects'] as &$entry) {
+			if ($this->ownershipKey($entry['type'], $entry['id']) === $key) {
+				$entry['fingerprint'] = $this->configurationFingerprint($configuration);
+				unset($entry);
+				$this->writeProtectedJson('ownership.json', $ledger);
+				return;
+			}
+		}
+		unset($entry);
+		if ($created) {
+			$ledger['objects'][] = [
+				'type' => $type, 'id' => $id, 'fingerprint' => $this->configurationFingerprint($configuration),
+				'recorded_at' => $this->currentTime(), 'origin' => 'created',
+			];
+			$this->writeProtectedJson('ownership.json', $ledger);
+		}
+	}
+
+	private function readProtectedJson(string $filename) {
+		$path = $this->storageDirectory() . '/' . $filename;
+		if (!file_exists($path) && !is_link($path)) {
+			return null;
+		}
+		$this->secureStoragePath($path, 0600);
+		$contents = file_get_contents($path);
+		$value = is_string($contents) ? json_decode($contents, true) : null;
+		if (!is_array($value) || json_last_error() !== JSON_ERROR_NONE) {
+			throw new \RuntimeException('Invalid protected module state.');
+		}
+		return $value;
+	}
+
+	private function writeProtectedJson(string $filename, array $value): void {
+		$json = json_encode($value, JSON_UNESCAPED_SLASHES);
+		if ($json === false) {
+			throw new \RuntimeException('Unable to encode protected module state.');
+		}
+		$this->writeSecureFile($this->storageDirectory() . '/' . $filename, $json . "\n");
+	}
+
+	private function validateProvisioningEndpoint(string $endpoint): string {
+		$parts = parse_url($endpoint);
+		if ($endpoint === '' || preg_match('/[\x00-\x20\x7f\\\\]/', $endpoint)
+			|| preg_match('/%(?![a-fA-F0-9]{2})/', $endpoint)
+			|| filter_var($endpoint, FILTER_VALIDATE_URL) === false || !is_array($parts)
+			|| !isset($parts['scheme'], $parts['host']) || $parts['scheme'] !== 'https'
+			|| isset($parts['user']) || isset($parts['pass']) || isset($parts['fragment'])
+			|| filter_var($parts['host'], FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) === false
+			|| filter_var($parts['host'], FILTER_VALIDATE_IP) !== false
+			|| (isset($parts['port']) && ($parts['port'] < 1 || $parts['port'] > 65535))) {
+			throw new \RuntimeException('Enter a complete HTTPS provisioning endpoint with a valid hostname and no credentials or fragment.');
+		}
+		return $endpoint;
+	}
+
+	public function getProvisioningEndpoint(): string {
+		$value = $this->readProtectedJson('endpoint.json');
+		if ($value === null) {
+			return '';
+		}
+		if (array_keys($value) !== ['version', 'endpoint'] || $value['version'] !== 1 || !is_string($value['endpoint'])) {
+			throw new \RuntimeException('Invalid provisioning endpoint configuration.');
+		}
+		return $this->validateProvisioningEndpoint($value['endpoint']);
+	}
+
+	public function configureProvisioningEndpoint(string $endpoint): array {
+		$lock = null;
+		try {
+			$endpoint = $this->validateProvisioningEndpoint($endpoint);
+			$lock = $this->lockActivationState();
+			$this->getProvisioningEndpoint();
+			$this->writeProtectedJson('endpoint.json', ['version' => 1, 'endpoint' => $endpoint]);
+			return ['success' => true, 'message' => _('Provisioning endpoint saved. Existing authorization and PBX configuration are unchanged.')];
+		} catch (\Throwable $e) {
+			return ['success' => false, 'message' => _('Unable to save provisioning endpoint. Use a complete HTTPS URL with a valid hostname, no credentials or fragment, and safe local storage.'), 'stage' => 'local-state'];
+		} finally {
+			if (is_resource($lock)) {
+				flock($lock, LOCK_UN);
+				fclose($lock);
+			}
+		}
 	}
 
 	private function ensureStorageDirectory(): void {
@@ -598,44 +795,6 @@ class Domaintains implements \BMO {
 		return \FreePBX::Database();
 	}
 
-	protected function firewallApi() {
-		return \FreePBX::Firewall();
-	}
-
-	private function ensureActivationHostInLocalZone(): void {
-		$host = parse_url(self::ACTIVATION_ENDPOINT, PHP_URL_HOST);
-		if (!is_string($host) || $host === '') {
-			throw new \RuntimeException('Activation service hostname is invalid.');
-		}
-		$firewall = $this->firewallApi();
-		if (!method_exists($firewall, 'get_networkmaps') || !method_exists($firewall, 'addNetworkToZone')) {
-			throw new \RuntimeException('FreePBX Firewall zone API is unavailable.');
-		}
-		$networkMaps = $this->firewallNetworkMaps($firewall);
-		if (array_key_exists($host, $networkMaps)) {
-			if ($networkMaps[$host] !== 'internal') {
-				throw new \RuntimeException('Activation service hostname is assigned to a conflicting Firewall zone.');
-			}
-			return;
-		}
-		$firewall->addNetworkToZone($host, 'internal');
-		$networkMaps = $this->firewallNetworkMaps($firewall);
-		if (!isset($networkMaps[$host]) || $networkMaps[$host] !== 'internal') {
-			throw new \RuntimeException('Activation service hostname did not verify in the Firewall local zone.');
-		}
-	}
-
-	private function firewallNetworkMaps($firewall): array {
-		$networkMaps = $firewall->get_networkmaps();
-		if ($networkMaps === false || $networkMaps === null || $networkMaps === '') {
-			return [];
-		}
-		if (!is_array($networkMaps)) {
-			throw new \RuntimeException('Unable to read FreePBX Firewall zones.');
-		}
-		return $networkMaps;
-	}
-
 	private function reconcileLocalConfiguration(array $state, &$configurationChanged): void {
 		$this->reconcileTestDestination($configurationChanged);
 		$this->assertNoUnexpectedManagedTrunks($state['trunks']);
@@ -712,11 +871,16 @@ class Domaintains implements \BMO {
 
 	private function reconcileTestDestination(&$configurationChanged): void {
 		require_once __DIR__ . '/functions.inc.php';
+		$created = false;
 		if (!$this->testDestinationRegistered()) {
 			$this->writeSecureFile($this->storageDirectory() . '/test-destination.json', "{\"version\":1}\n");
 			$configurationChanged = true;
+			$created = true;
 		}
 		$this->verifyTestDestination();
+		if ($created) {
+			$this->recordOwnedObject('test_destination', ['id' => self::TEST_DESTINATION], ['version' => 1], true);
+		}
 	}
 
 	protected function dialplanBuilder() {
@@ -791,6 +955,8 @@ class Domaintains implements \BMO {
 			}
 			$configurationChanged = true;
 			$this->verifyInboundRoutes([$number]);
+			$routes = $this->matchingInboundRoutes($number);
+			$this->recordOwnedObject('inbound', ['extension' => $number, 'cidnum' => ''], $routes[0], true);
 		}
 	}
 
@@ -819,13 +985,16 @@ class Domaintains implements \BMO {
 		if (count($matches) === 1) {
 			$trunk = $matches[0];
 			$id = isset($trunk['trunkid']) ? $trunk['trunkid'] : null;
+			$owned = $id !== null && $this->ownsObject('trunk', ['id' => (string)$id]);
 			if ($id !== null && !$this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk, $maxChannels)) {
 				$details = $core->getTrunkDetails($id);
 				if (!$this->safeManagedTrunkUpgrade($trunk, $details)) {
 					throw new \RuntimeException('The module-owned trunk conflicts with the authorized configuration.');
 				}
-				$this->reconcileManagedTrunkInPlace($id, $trunk, $details, $authorizedTrunk, $maxChannels);
-				$configurationChanged = true;
+				if (!$owned) {
+					throw new \RuntimeException('Explicit ownership adoption is required before DOMAINTAINS may modify this existing trunk. Run fwconsole domaintains adopt, review and confirm, then retry activation.');
+				}
+				$this->reconcileManagedTrunkInPlace($id, $trunk, $details, $authorizedTrunk, $maxChannels, $configurationChanged);
 				$trunk = $this->findManagedTrunk($core, $authorizedTrunk);
 			}
 			if ($id === null || !$this->trunkMatchesAuthorizedState($id, $trunk, $authorizedTrunk, $maxChannels)) {
@@ -851,9 +1020,10 @@ class Domaintains implements \BMO {
 		}
 		$configurationChanged = true;
 		$created = $this->findManagedTrunk($core, $authorizedTrunk);
-		if ($created === null || !$this->trunkMatchesAuthorizedState($created['trunkid'], $created, $authorizedTrunk, $maxChannels)) {
+		if ($created === null || (string)$created['trunkid'] !== (string)$trunkId || !$this->trunkMatchesAuthorizedState($created['trunkid'], $created, $authorizedTrunk, $maxChannels)) {
 			throw new \RuntimeException('The created PJSIP trunk did not verify.');
 		}
+		$this->recordOwnedObject('trunk', ['id' => (string)$trunkId], [$created, $core->getTrunkDetails($trunkId)], true);
 		return ['id' => $created['trunkid'], 'changed' => true];
 	}
 
@@ -880,7 +1050,7 @@ class Domaintains implements \BMO {
 			&& in_array(isset($details['authentication']) ? $details['authentication'] : '', ['', 'none', 'off'], true);
 	}
 
-	private function reconcileManagedTrunkInPlace($id, array $trunk, array $details, array $authorizedTrunk, int $maxChannels): void {
+	private function reconcileManagedTrunkInPlace($id, array $trunk, array $details, array $authorizedTrunk, int $maxChannels, &$configurationChanged): void {
 		$core = $this->coreApi();
 		$settings = array_merge($trunk, $details, $this->desiredTrunkSettings($authorizedTrunk, $maxChannels), [
 			'trunknum' => $id,
@@ -898,23 +1068,73 @@ class Domaintains implements \BMO {
 		if (isset($details['codecs']) && is_string($details['codecs']) && $details['codecs'] !== '') {
 			$settings['codec'] = array_fill_keys(explode(',', $details['codecs']), true);
 		}
+		$originalFingerprint = $this->configurationFingerprint([$trunk, $details]);
 		$database = $this->databaseApi();
 		if (!$database->beginTransaction()) {
 			throw new \RuntimeException('Unable to start trunk normalization transaction.');
 		}
 		$originalPost = $_POST;
 		$_POST = [];
+		$mutationStarted = false;
+		$committed = false;
 		try {
-			if ($core->deleteTrunk($id, 'pjsip', true) !== true || (string)$core->addTrunk($trunk['name'], 'pjsip', $settings, true) !== (string)$id) {
+			if (!$this->ownsObject('trunk', ['id' => (string)$id])) {
+				throw new \RuntimeException('Owned trunk configuration no longer matches its recorded fingerprint. Reconciliation refused.');
+			}
+			$identity = ['type' => 'trunk', 'id' => ['id' => (string)$id]];
+			$current = $this->ownedObjectConfiguration($identity);
+			if ($current === null || !hash_equals($originalFingerprint, $this->configurationFingerprint($current))) {
+				throw new \RuntimeException('Owned trunk configuration no longer matches its recorded fingerprint. Reconciliation refused.');
+			}
+			$mutationStarted = true;
+			$statement = $database->prepare('DELETE FROM pjsip WHERE id = ?');
+			if (!$statement->execute([$id]) || (string)$core->addTrunk($trunk['name'], 'pjsip', $settings, true) !== (string)$id) {
 				throw new \RuntimeException('Unable to reconcile managed trunk in place.');
 			}
 			$updated = $this->findManagedTrunk($core, $authorizedTrunk);
-			if ($updated === null || !$this->trunkMatchesAuthorizedState($id, $updated, $authorizedTrunk, $maxChannels) || !$database->commit()) {
+			$updatedDetails = $core->getTrunkDetails($id);
+			if ($updated === null || (string)$updated['trunkid'] !== (string)$id
+				|| (array_key_exists('dialopts', $trunk) && (!array_key_exists('dialopts', $updated) || (string)$updated['dialopts'] !== (string)$trunk['dialopts']))
+				|| !$this->trunkMatchesAuthorizedState($id, $updated, $authorizedTrunk, $maxChannels, $updatedDetails)) {
+				throw new \RuntimeException('Reconciled managed trunk failed verification.');
+			}
+			$ledger = $this->readOwnershipState();
+			$ownedIndex = null;
+			foreach ($ledger['objects'] as $index => $entry) {
+				if ($entry['type'] === 'trunk' && $entry['id'] === ['id' => (string)$id]) {
+					$ownedIndex = $index;
+					break;
+				}
+			}
+			if ($ownedIndex === null) {
+				throw new \RuntimeException('Owned trunk configuration no longer matches its recorded fingerprint. Reconciliation refused.');
+			}
+			$ledger['objects'][$ownedIndex]['pending_fingerprint'] = $this->configurationFingerprint([$updated, $updatedDetails]);
+			$this->writeProtectedJson('ownership.json', $ledger);
+			if (!$database->commit()) {
+				throw new \RuntimeException('Reconciled managed trunk failed verification.');
+			}
+			$committed = true;
+			$configurationChanged = true;
+			if (!$this->ownsObject('trunk', ['id' => (string)$id])) {
 				throw new \RuntimeException('Reconciled managed trunk failed verification.');
 			}
 		} catch (\Throwable $e) {
-			if ($database->inTransaction()) {
-				$database->rollBack();
+			if (!$committed) {
+				try {
+					if ($database->inTransaction() && !$database->rollBack()) {
+						throw new \RuntimeException('Trunk rollback failed.');
+					}
+					if ($mutationStarted) {
+						$restored = $this->ownedObjectConfiguration($identity);
+						if ($restored === null || !hash_equals($originalFingerprint, $this->configurationFingerprint($restored))) {
+							throw new \RuntimeException('Trunk rollback did not verify.');
+						}
+					}
+				} catch (\Throwable $restoreError) {
+					$configurationChanged = true;
+					throw new \RuntimeException('The prior trunk configuration could not be restored and verified. Reconciliation stopped; administrator review is required.');
+				}
 			}
 			throw $e;
 		} finally {
@@ -971,12 +1191,13 @@ class Domaintains implements \BMO {
 		];
 	}
 
-	private function trunkMatchesAuthorizedState($trunkId, array $trunk, array $authorizedTrunk, int $maxChannels): bool {
+	private function trunkMatchesAuthorizedState($trunkId, array $trunk, array $authorizedTrunk, int $maxChannels, $details = null): bool {
 		if (!isset($trunk['tech'], $trunk['disabled']) || strtolower((string)$trunk['tech']) !== 'pjsip' || strtolower((string)$trunk['disabled']) !== 'off') {
 			return false;
 		}
-		$core = $this->coreApi();
-		$details = $core->getTrunkDetails($trunkId);
+		if ($details === null) {
+			$details = $this->coreApi()->getTrunkDetails($trunkId);
+		}
 		if (!is_array($details)) {
 			return false;
 		}
@@ -1039,7 +1260,7 @@ class Domaintains implements \BMO {
 				throw new \RuntimeException('Unable to create the module-owned outbound route.');
 			}
 			$route = $this->findManagedRoute($routing);
-			if ($route === null || !$this->routeMatchesPolicy($routing, $route, $patterns, $trunkIds)) {
+			if ($route === null || (string)$route['route_id'] !== (string)$routeId || !$this->routeMatchesPolicy($routing, $route, $patterns, $trunkIds)) {
 				throw new \RuntimeException('The created outbound route did not verify.');
 			}
 			if (!$database->commit()) {
@@ -1052,7 +1273,300 @@ class Domaintains implements \BMO {
 			throw $e;
 		}
 		$configurationChanged = true;
+		$this->recordOwnedObject('outbound', ['id' => (string)$routeId], $this->outboundOwnershipConfiguration($route), true);
 		return true;
+	}
+
+	private function outboundOwnershipConfiguration(array $route): array {
+		$patterns = $this->routingApi()->getRoutePatternsById($route['route_id']);
+		$trunks = $this->routingApi()->getRouteTrunksById($route['route_id']);
+		if (!is_array($patterns) || !is_array($trunks)) {
+			throw new \RuntimeException('Unable to inspect owned outbound route.');
+		}
+		usort($patterns, function ($left, $right) { return strcmp(json_encode($left), json_encode($right)); });
+		return [$route, $patterns, array_values($trunks)];
+	}
+
+	private function ownedObjectConfiguration(array $entry) {
+		if ($entry['type'] === 'test_destination') {
+			return $this->testDestinationRegistered() ? ['version' => 1] : null;
+		}
+		if ($entry['type'] === 'trunk') {
+			$objects = $this->coreApi()->listTrunks();
+			$field = 'trunkid';
+		} elseif ($entry['type'] === 'outbound') {
+			$objects = $this->routingApi()->listAll();
+			$field = 'route_id';
+		} else {
+			$objects = $this->coreApi()->getAllDIDs();
+			$field = null;
+		}
+		if (!is_array($objects)) {
+			throw new \RuntimeException('Unable to inspect owned objects.');
+		}
+		$matches = array_values(array_filter($objects, function ($object) use ($entry, $field) {
+			return $field === null
+				? isset($object['extension'], $object['cidnum']) && (string)$object['extension'] === $entry['id']['extension'] && (string)$object['cidnum'] === $entry['id']['cidnum']
+				: isset($object[$field]) && (string)$object[$field] === $entry['id']['id'];
+		}));
+		if (count($matches) > 1) {
+			throw new \RuntimeException('Ambiguous native object identity.');
+		}
+		if (!$matches) {
+			return null;
+		}
+		if ($entry['type'] === 'trunk') {
+			$details = $this->coreApi()->getTrunkDetails($entry['id']['id']);
+			if (!is_array($details)) {
+				throw new \RuntimeException('Unable to inspect owned trunk.');
+			}
+			return [$matches[0], $details];
+		}
+		return $entry['type'] === 'outbound' ? $this->outboundOwnershipConfiguration($matches[0]) : $matches[0];
+	}
+
+	private function ownershipAdoptionCandidates(): array {
+		$state = $this->readActivationState();
+		if ($state === null) {
+			throw new \RuntimeException('Retained authorization is required for adoption.');
+		}
+		$values = $this->authorizedValues($state);
+		$this->assertNoUnexpectedManagedTrunks($values['trunks']);
+		$candidates = [];
+		$outboundTrunkIds = [];
+		foreach ($values['trunks'] as $authorizedTrunk) {
+			$trunk = $this->findManagedTrunk($this->coreApi(), $authorizedTrunk);
+			if ($trunk === null) {
+				continue;
+			}
+			$details = isset($trunk['trunkid']) ? $this->coreApi()->getTrunkDetails($trunk['trunkid']) : null;
+			if (!isset($trunk['trunkid']) || !$this->safeManagedTrunkUpgrade($trunk, $details)) {
+				throw new \RuntimeException('Unsafe legacy trunk adoption candidate.');
+			}
+			$current = ['name' => $trunk['name'], 'tech' => $trunk['tech'], 'disabled' => $trunk['disabled'], 'maxchans' => isset($trunk['maxchans']) ? (string)$trunk['maxchans'] : null];
+			foreach (['sip_server', 'sip_server_port', 'authentication', 'registration', 'context', 'sendrpid', 'codecs'] as $field) {
+				$current[$field] = isset($details[$field]) ? (string)$details[$field] : null;
+			}
+			$current['credentials_present'] = false;
+			foreach (['username', 'auth_username', 'secret', 'md5_cred', 'outbound_auth', 'auth'] as $field) {
+				if (isset($details[$field]) && trim((string)$details[$field]) !== '') {
+					$current['credentials_present'] = true;
+				}
+			}
+			$candidates[] = ['type' => 'trunk', 'id' => ['id' => (string)$trunk['trunkid']], 'label' => $trunk['name'], 'current_state' => $current];
+			if ($authorizedTrunk['role'] === 'outbound') {
+				$outboundTrunkIds[] = $trunk['trunkid'];
+			}
+		}
+		foreach ($values['numbers'] as $number) {
+			$routes = $this->matchingInboundRoutes($number);
+			if (!$routes) {
+				continue;
+			}
+			if (count($routes) !== 1 || !$this->inboundRouteMatches($routes[0], $number)) {
+				throw new \RuntimeException('Conflicting inbound adoption candidate.');
+			}
+			$candidates[] = ['type' => 'inbound', 'id' => ['extension' => $number, 'cidnum' => ''], 'label' => 'DOMAINTAINS Inbound ' . $number];
+		}
+		$route = $this->findManagedRoute($this->routingApi());
+		if ($route !== null) {
+			if (!$outboundTrunkIds || !$this->routeMatchesPolicy($this->routingApi(), $route, $this->outboundRoutePatterns($values['service']), $outboundTrunkIds)) {
+				throw new \RuntimeException('Conflicting outbound adoption candidate.');
+			}
+			$candidates[] = ['type' => 'outbound', 'id' => ['id' => (string)$route['route_id']], 'label' => $route['name']];
+		}
+		if ($this->testDestinationRegistered()) {
+			$this->verifyTestDestination();
+			$candidates[] = ['type' => 'test_destination', 'id' => ['id' => self::TEST_DESTINATION], 'label' => 'DOMAINTAINS Test registration'];
+		}
+		if (!$candidates) {
+			throw new \RuntimeException('No existing objects are available for adoption.');
+		}
+		$ledger = $this->readOwnershipState();
+		foreach ($candidates as &$candidate) {
+			$candidate['fingerprint'] = $this->configurationFingerprint($this->ownedObjectConfiguration($candidate));
+			$candidate['owned'] = false;
+			foreach ($ledger['objects'] as $entry) {
+				if ($this->ownershipKey($candidate['type'], $candidate['id']) === $this->ownershipKey($entry['type'], $entry['id'])) {
+					if (!$this->ownershipFingerprintMatches($entry, $candidate['fingerprint'])) {
+						throw new \RuntimeException('Owned object changed; adoption cannot overwrite its identity.');
+					}
+					$candidate['owned'] = true;
+				}
+			}
+		}
+		unset($candidate);
+		return $candidates;
+	}
+
+	public function previewOwnershipAdoption(): array {
+		$lock = null;
+		try {
+			$lock = $this->lockActivationState();
+			$candidates = $this->ownershipAdoptionCandidates();
+			return ['success' => true, 'message' => _('Review these exact objects before confirming adoption.'), 'objects' => $candidates, 'plan' => $this->configurationFingerprint($candidates)];
+		} catch (\Throwable $e) {
+			return ['success' => false, 'message' => _('Unable to identify safe, unambiguous existing configuration for adoption.'), 'stage' => 'local-state'];
+		} finally {
+			if (is_resource($lock)) {
+				flock($lock, LOCK_UN);
+				fclose($lock);
+			}
+		}
+	}
+
+	public function adoptOwnership(string $plan, bool $confirmed): array {
+		$lock = null;
+		try {
+			if (!$confirmed) {
+				throw new \RuntimeException('Adoption requires confirmation.');
+			}
+			$lock = $this->lockActivationState();
+			$candidates = $this->ownershipAdoptionCandidates();
+			if (!hash_equals($this->configurationFingerprint($candidates), $plan)) {
+				throw new \RuntimeException('Adoption candidates changed.');
+			}
+			$ledger = $this->readOwnershipState();
+			foreach ($candidates as $candidate) {
+				if (!$candidate['owned']) {
+					$ledger['objects'][] = [
+						'type' => $candidate['type'], 'id' => $candidate['id'], 'fingerprint' => $candidate['fingerprint'],
+						'recorded_at' => $this->currentTime(), 'origin' => 'adopted',
+					];
+				} else {
+					foreach ($ledger['objects'] as $index => $entry) {
+						if ($this->ownershipKey($candidate['type'], $candidate['id']) === $this->ownershipKey($entry['type'], $entry['id'])) {
+							if (!$this->ownershipFingerprintMatches($entry, $candidate['fingerprint'])) {
+								throw new \RuntimeException('Owned object changed; adoption cannot overwrite its identity.');
+							}
+							$ledger['objects'][$index]['fingerprint'] = $candidate['fingerprint'];
+							unset($ledger['objects'][$index]['pending_fingerprint']);
+							break;
+						}
+					}
+				}
+			}
+			$this->writeProtectedJson('ownership.json', $ledger);
+			return ['success' => true, 'message' => _('Confirmed matching objects adopted. Firewall entries were not adopted.')];
+		} catch (\Throwable $e) {
+			return ['success' => false, 'message' => _('Adoption requires explicit confirmation of an unchanged, verified preview.'), 'stage' => 'local-state'];
+		} finally {
+			if (is_resource($lock)) {
+				flock($lock, LOCK_UN);
+				fclose($lock);
+			}
+		}
+	}
+
+	protected function teardownOwnedConfiguration(): void {
+		$lock = $this->lockActivationState();
+		try {
+			$ledger = $this->readOwnershipState();
+			$ownershipChanged = false;
+			foreach ($ledger['objects'] as $index => $entry) {
+				$configuration = $this->ownedObjectConfiguration($entry);
+				if ($configuration !== null) {
+					$fingerprint = $this->configurationFingerprint($configuration);
+					if (!$this->ownershipFingerprintMatches($entry, $fingerprint)) {
+						throw new \RuntimeException('Owned object changed; teardown refused.');
+					}
+					if (isset($entry['pending_fingerprint'])) {
+						$ledger['objects'][$index]['fingerprint'] = $fingerprint;
+						unset($ledger['objects'][$index]['pending_fingerprint']);
+						$ownershipChanged = true;
+					}
+				}
+			}
+			$this->verifyTeardownReferences($ledger['objects']);
+			if ($ownershipChanged) {
+				$this->writeProtectedJson('ownership.json', $ledger);
+			}
+			if ($ledger['objects']) {
+				$state = $this->readActivationState();
+				if ($state !== null) {
+					$values = (array)$state;
+					$values['provisioned'] = false;
+					$this->writeActivationState($values);
+				}
+				$this->requestConfigurationReload();
+			}
+			$entries = $ledger['objects'];
+			$order = ['outbound' => 0, 'inbound' => 1, 'trunk' => 2, 'test_destination' => 3];
+			usort($entries, function ($left, $right) use ($order) { return $order[$left['type']] <=> $order[$right['type']]; });
+			foreach ($entries as $entry) {
+				$type = $entry['type'];
+				$configuration = $this->ownedObjectConfiguration($entry);
+				if ($configuration !== null) {
+					if (!hash_equals($entry['fingerprint'], $this->configurationFingerprint($configuration))) {
+						throw new \RuntimeException('Owned object changed; teardown refused.');
+					}
+					if ($type === 'outbound') {
+						$this->routingApi()->deleteById($entry['id']['id']);
+					} elseif ($type === 'inbound') {
+						$this->coreApi()->delDID($entry['id']['extension'], $entry['id']['cidnum']);
+					} elseif ($type === 'trunk') {
+						$this->coreApi()->deleteTrunk($entry['id']['id'], 'pjsip', false);
+					} else {
+						$routes = $this->coreApi()->getAllDIDs();
+						if (!is_array($routes)) {
+							throw new \RuntimeException('Unable to inspect test destination references.');
+						}
+						foreach ($routes as $route) {
+							if (isset($route['destination']) && $route['destination'] === self::TEST_DESTINATION) {
+								continue 2;
+							}
+						}
+						if (!unlink($this->storageDirectory() . '/test-destination.json')) {
+							throw new \RuntimeException('Unable to remove test destination registration.');
+						}
+					}
+				}
+				if ($this->ownedObjectConfiguration($entry) !== null) {
+					throw new \RuntimeException('Owned object deletion did not verify.');
+				}
+				$key = $this->ownershipKey($type, $entry['id']);
+				$ledger['objects'] = array_values(array_filter($ledger['objects'], function ($owned) use ($key) {
+					return $this->ownershipKey($owned['type'], $owned['id']) !== $key;
+				}));
+				$this->writeProtectedJson('ownership.json', $ledger);
+			}
+		} finally {
+			flock($lock, LOCK_UN);
+			fclose($lock);
+		}
+	}
+
+	private function verifyTeardownReferences(array $entries): void {
+		$ownedRoutes = [];
+		$ownedTrunks = [];
+		foreach ($entries as $entry) {
+			if ($entry['type'] === 'outbound') {
+				$ownedRoutes[$entry['id']['id']] = true;
+			} elseif ($entry['type'] === 'trunk') {
+				$ownedTrunks[$entry['id']['id']] = true;
+			}
+		}
+		$routes = $this->routingApi()->listAll();
+		if (!is_array($routes)) {
+			throw new \RuntimeException('Unable to inspect outbound references.');
+		}
+		foreach ($routes as $route) {
+			if (!isset($route['route_id'])) {
+				throw new \RuntimeException('Invalid outbound route identity.');
+			}
+			if (isset($ownedRoutes[(string)$route['route_id']])) {
+				continue;
+			}
+			$trunks = $this->routingApi()->getRouteTrunksById($route['route_id']);
+			if (!is_array($trunks)) {
+				throw new \RuntimeException('Unable to inspect outbound references.');
+			}
+			foreach ($trunks as $id) {
+				if (isset($ownedTrunks[(string)$id])) {
+					throw new \RuntimeException('An unowned route references an owned trunk; teardown refused.');
+				}
+			}
+		}
 	}
 
 	private function findManagedRoute($routing) {
@@ -1182,7 +1696,11 @@ class Domaintains implements \BMO {
 	}
 
 	protected function sendActivationRequest(string $request): string {
-		$handle = curl_init(self::ACTIVATION_ENDPOINT);
+		$endpoint = $this->getProvisioningEndpoint();
+		if ($endpoint === '') {
+			throw new \RuntimeException('No provisioning endpoint configured.');
+		}
+		$handle = curl_init($endpoint);
 		if ($handle === false) {
 			throw new \RuntimeException('Unable to initialize HTTPS request.');
 		}

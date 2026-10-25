@@ -78,6 +78,11 @@ class ActivationContractCoreApi {
 		unset($this->details[$id]);
 		return true;
 	}
+	public function delDID($extension, $cidnum): void {
+		$this->dids = array_values(array_filter($this->dids, function ($route) use ($extension, $cidnum) {
+			return (string)$route['extension'] !== (string)$extension || (string)$route['cidnum'] !== (string)$cidnum;
+		}));
+	}
 
 	public function listTrunks(): array {
 		$this->trunkListCalls++;
@@ -113,6 +118,9 @@ class ActivationContractCoreApi {
 		$this->postWasIsolated = empty($_POST);
 		$this->lastTrunkSettings = $settings;
 		$trunkId = $edit ? $settings['trunknum'] : 'synthetic-trunk-' . $this->addCalls;
+		if ($edit) {
+			$this->trunks = array_values(array_filter($this->trunks, function ($trunk) use ($trunkId) { return (string)$trunk['trunkid'] !== (string)$trunkId; }));
+		}
 		$this->trunks[] = [
 			'trunkid' => $trunkId,
 			'name' => $name,
@@ -148,8 +156,10 @@ class ActivationContractCoreApi {
 class ActivationContractFirewallApi {
 	public $networkMaps = [];
 	public $addCalls = 0;
+	public $readCalls = 0;
 
 	public function get_networkmaps() {
+		$this->readCalls++;
 		return $this->networkMaps;
 	}
 
@@ -173,6 +183,12 @@ class ActivationContractRoutingApi {
 
 	public function listAll(): array {
 		return $this->routes;
+	}
+
+	public function deleteById($id) {
+		$this->routes = array_values(array_filter($this->routes, function ($route) use ($id) { return (string)$route['route_id'] !== (string)$id; }));
+		unset($this->patterns[$id], $this->trunks[$id]);
+		return $this;
 	}
 
 	public function getRoutePatternsById($routeId): array {
@@ -206,6 +222,18 @@ class ActivationContractRoutingApi {
 		return true;
 	}
 
+	public function prepare($sql) {
+		activation_assert($sql === 'DELETE FROM pjsip WHERE id = ?', 'only owned PJSIP detail replacement is supported');
+		return new class($this->coreApi) {
+			private $core;
+			public function __construct($core) { $this->core = $core; }
+			public function execute($parameters): bool {
+				unset($this->core->details[$parameters[0]]);
+				return true;
+			}
+		};
+	}
+
 	public function commit(): bool {
 		$this->transactionSnapshot = null;
 		return true;
@@ -234,13 +262,13 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 	private $routing;
 	private $firewall;
 	public $localHostnameValue = 'my-12345678';
-	public $activationHostWasLocalBeforeRequest = false;
+	public $requestedEndpoints = [];
 	public $reloadRequests = 0;
 	public $remoteException = null;
 	public $reloadException = null;
 	public $failDialplanVerification = false;
 
-	public function __construct(string $directory, array $responses, $core = null, $routing = null, $firewall = null) {
+	public function __construct(string $directory, array $responses, $core = null, $routing = null, $firewall = null, bool $configureEndpoint = true) {
 		parent::__construct(new stdClass());
 		$this->directory = $directory;
 		$this->responses = $responses;
@@ -249,6 +277,9 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 		$this->routing->coreApi = $this->core;
 		$this->firewall = $firewall === null ? new ActivationContractFirewallApi() : $firewall;
 		FreePBX::$module = $this;
+		if ($configureEndpoint && !file_exists($directory . '/endpoint.json') && !is_link($directory . '/endpoint.json')) {
+			activation_assert($this->configureProvisioningEndpoint('https://control.example.invalid/activate')['success'], 'synthetic provisioning endpoint should configure');
+		}
 	}
 
 	protected function dialplanBuilder() {
@@ -331,7 +362,7 @@ class ActivationContractModule extends \FreePBX\modules\Domaintains {
 	protected function sendActivationRequest(string $request): string {
 		$this->requests[] = $request;
 		if ($this->remoteException !== null) { throw $this->remoteException; }
-		$this->activationHostWasLocalBeforeRequest = isset($this->firewall->networkMaps['my-connect.freepbxhosting.uk']) && $this->firewall->networkMaps['my-connect.freepbxhosting.uk'] === 'internal';
+		$this->requestedEndpoints[] = $this->getProvisioningEndpoint();
 		if ($this->responses !== []) {
 			$this->lastResponse = (string)array_shift($this->responses);
 		}
@@ -407,6 +438,12 @@ function activation_attempt(string $response): array {
 	}
 }
 
+function activation_adopt_current(ActivationContractModule $module): void {
+	$preview = $module->previewOwnershipAdoption();
+	activation_assert($preview['success'], 'explicit adoption preview should identify safe existing candidates');
+	activation_assert($module->adoptOwnership($preview['plan'], true)['success'], 'confirmed adoption should record existing candidate ownership');
+}
+
 $originalPost = $_POST;
 $_POST = ['activation_key' => 'synthetic-test-token'];
 list($result, $directory, $module) = activation_attempt(activation_fixture_response());
@@ -424,7 +461,7 @@ activation_assert($module->coreFixture()->postWasIsolated, 'Core trunk creation 
 activation_assert(!isset($module->coreFixture()->lastTrunkSettings['activation_key']), 'activation key must not be forwarded to the Core trunk API');
 activation_assert($module->routingFixture()->addCalls === 1, 'fresh provisioning should create one outbound route');
 activation_assert($module->reloadRequests === 1, 'fresh provisioning should request one reload after configuration changes');
-activation_assert($module->firewallFixture()->addCalls === 1 && $module->activationHostWasLocalBeforeRequest, 'activation host should be ensured in the Firewall internal zone before HTTP activation');
+activation_assert($module->firewallFixture()->addCalls === 0 && $module->firewallFixture()->readCalls === 0 && $module->firewallFixture()->networkMaps === [], 'outbound HTTPS activation must not inspect or alter Firewall trust');
 $trunkRecord = $module->coreFixture()->trunks[0];
 $trunkSettings = $module->coreFixture()->getTrunkDetails($trunkRecord['trunkid']);
 activation_assert($trunkRecord['tech'] === 'pjsip', 'managed trunk should use PJSIP');
@@ -454,17 +491,17 @@ $emptyFirewall = new ActivationContractFirewallApi();
 $emptyFirewall->networkMaps = false;
 $emptyFirewallModule = new ActivationContractModule($directory, [activation_fixture_response()], null, null, $emptyFirewall);
 $emptyFirewallResult = $emptyFirewallModule->activate('synthetic-test-token');
-activation_assert($emptyFirewallResult['success'] === true, 'an unset Firewall map should be treated as empty on first activation');
-activation_assert($emptyFirewall->networkMaps['my-connect.freepbxhosting.uk'] === 'internal', 'first activation should add the service host to the local zone');
+activation_assert($emptyFirewallResult['success'] === true, 'activation must not require a Firewall map');
+activation_assert($emptyFirewall->networkMaps === false && $emptyFirewall->addCalls === 0 && $emptyFirewall->readCalls === 0, 'first activation must leave an unset Firewall map untouched');
 activation_cleanup($directory);
 
 $directory = activation_temp_directory();
 $conflictingFirewall = new ActivationContractFirewallApi();
-$conflictingFirewall->networkMaps['my-connect.freepbxhosting.uk'] = 'other';
+$conflictingFirewall->networkMaps['control.example.invalid'] = 'other';
 $firewallConflictModule = new ActivationContractModule($directory, [activation_fixture_response()], null, null, $conflictingFirewall);
 $firewallConflictResult = $firewallConflictModule->activate('synthetic-test-token');
-activation_assert($firewallConflictResult['success'] === false, 'conflicting Firewall zone assignment must fail closed');
-activation_assert(count($firewallConflictModule->requests()) === 0 && $conflictingFirewall->addCalls === 0, 'Firewall conflict must neither contact my-connect nor change the existing zone');
+activation_assert($firewallConflictResult['success'] === true && count($firewallConflictModule->requests()) === 1, 'existing Firewall zones must not govern outbound provisioning');
+activation_assert($conflictingFirewall->networkMaps === ['control.example.invalid' => 'other'] && $conflictingFirewall->addCalls === 0 && $conflictingFirewall->readCalls === 0, 'activation must preserve existing endpoint-host Firewall configuration without inspecting it');
 activation_cleanup($directory);
 
 $directory = activation_temp_directory();
@@ -757,20 +794,26 @@ $driftCore->details['synthetic-admin'] = ['trunk_name' => 'Administrator Link', 
 $adminTrunkDetails = $driftCore->details['synthetic-admin'];
 $driftModule = new ActivationContractModule($directory, [$driftResponse], $driftCore);
 activation_assert($driftModule->activate('synthetic-test-token')['success'], 'both authorized trunk roles should initially provision');
+$ownedTrunksBeforeDrift = $driftCore->trunks;
 foreach ($driftCore->trunks as $index => $managedTrunk) {
 	if ($managedTrunk['trunkid'] !== 'synthetic-admin') {
 		$driftCore->trunks[$index]['maxchans'] = '9';
 	}
 }
 $driftModule->queueResponse($driftResponse);
-activation_assert($driftModule->activate('synthetic-test-token')['success'], 'provider refresh should repair manual channel-limit drift');
-activation_assert($driftCore->editCalls === 2, 'wrong maxchans on inbound and outbound managed trunks must be repaired in place');
+activation_assert(!$driftModule->activate('synthetic-test-token')['success'] && $driftCore->editCalls === 0, 'external channel-limit drift must fail closed without authorizing repair by native ID alone');
+$driftCore->trunks = $ownedTrunksBeforeDrift;
+$updatedEntitlement = json_decode($driftResponse, true);
+$updatedEntitlement['max_channels'] = 10;
+$driftModule->queueResponse(json_encode($updatedEntitlement));
+activation_assert($driftModule->activate('synthetic-test-token')['success'], 'provider channel-limit changes should reconcile when current ownership fingerprints still match');
+activation_assert($driftCore->editCalls === 2, 'authorized changes to inbound and outbound owned trunks must reconcile in place');
 foreach (array_filter($driftCore->trunks, function ($trunk) { return $trunk['trunkid'] !== 'synthetic-admin'; }) as $managedTrunk) {
-	activation_assert($managedTrunk['maxchans'] === '5', 'reconciled managed trunks must have the authorized maxchans');
+	activation_assert($managedTrunk['maxchans'] === '10', 'reconciled managed trunks must have the newly authorized maxchans');
 }
 activation_assert($driftCore->details['synthetic-admin'] === $adminTrunkDetails && in_array($adminTrunk, $driftCore->trunks, true), 'channel-limit reconciliation must not modify administrator-owned trunks');
 $editCountAfterRepair = $driftCore->editCalls;
-$driftModule->queueResponse($driftResponse);
+$driftModule->queueResponse(json_encode($updatedEntitlement));
 activation_assert($driftModule->activate('synthetic-test-token')['success'] && $driftCore->editCalls === $editCountAfterRepair, 'correct maxchans must not cause unnecessary managed trunk edits');
 activation_cleanup($directory);
 
@@ -864,7 +907,13 @@ $legacyCore = new ActivationContractCoreApi();
 $legacyCore->seedManagedTrunk('sip.example.invalid', 5060, ['authentication' => 'none']);
 $legacyId = $legacyCore->trunks[0]['trunkid'];
 $legacyModule = new ActivationContractModule($directory, [activation_fixture_response()], $legacyCore);
-activation_assert($legacyModule->activate('synthetic-test-token')['success'], 'legacy managed None authentication should normalize to the GUI off value');
+$legacyBefore = [$legacyCore->trunks, $legacyCore->details];
+$legacyResult = $legacyModule->activate('synthetic-test-token');
+activation_assert(!$legacyResult['success'] && strpos($legacyResult['message'], 'Explicit ownership adoption is required') === 0, 'unowned legacy normalization must require explicit adoption');
+activation_assert([$legacyCore->trunks, $legacyCore->details] === $legacyBefore && $legacyCore->editCalls === 0, 'unowned legacy authentication must remain unchanged');
+activation_adopt_current($legacyModule);
+activation_assert([$legacyCore->trunks, $legacyCore->details] === $legacyBefore, 'adoption must record current state without normalizing it');
+activation_assert($legacyModule->activate('synthetic-test-token')['success'], 'explicitly adopted legacy None authentication should normalize to the GUI off value');
 activation_assert($legacyCore->editCalls === 1 && $legacyCore->getTrunkDetails($legacyId)['authentication'] === 'off', 'normalization must retain the same managed trunk ID and select Authentication None');
 activation_assert($legacyCore->getTrunkDetails($legacyId)['registration'] === 'none', 'normalization must retain Registration None');
 activation_cleanup($directory);
@@ -961,6 +1010,8 @@ $retainedState['last_error_stage'] = 'local';
 file_put_contents($directory . '/state.json', json_encode($retainedState));
 $migrationCore->trunks = array_values(array_filter($migrationCore->trunks, function ($trunk) { return $trunk['trunkid'] !== 'synthetic-duplicate-out'; }));
 unset($migrationCore->details['synthetic-duplicate-out']);
+activation_adopt_current($migrationModule);
+activation_assert($migrationCore->editCalls === 0 && $migrationCore->addCalls === 0, 'legacy adoption must not edit or create trunks');
 $migratedResult = $migrationModule->activate('synthetic-test-token');
 activation_assert($migratedResult['success'], 'unambiguous legacy inbound/outbound trunks should migrate on local retry');
 activation_assert(count($migrationModule->requests()) === 2 && $migrationCore->addCalls === 0 && $migrationCore->editCalls === 2, 'migration must preserve IDs without creating duplicate trunks');
@@ -1004,7 +1055,11 @@ $changedHostResponse = activation_fixture_response(['trunks' => [
 	['role' => 'outbound', 'sip_host' => 'updated-out.example.invalid', 'sip_port' => 5062],
 ]]);
 $changedHostModule = new ActivationContractModule($directory, [$changedHostResponse], $stableCore, $stableRouting);
-activation_assert($changedHostModule->activate('synthetic-test-token')['success'], 'changed authorized hosts should reconcile in place when each role has one target');
+$beforeUnownedHostChange = [$stableCore->trunks, $stableCore->details];
+activation_assert(!$changedHostModule->activate('synthetic-test-token')['success'], 'changed authorized hosts must not modify unowned retained trunks');
+activation_assert([$stableCore->trunks, $stableCore->details] === $beforeUnownedHostChange, 'unowned SIP hosts must stay unchanged before adoption');
+activation_adopt_current($changedHostModule);
+activation_assert($changedHostModule->activate('synthetic-test-token')['success'], 'changed authorized hosts should reconcile only after explicit ownership adoption');
 activation_assert($stableCore->addCalls === 2 && array_column($stableCore->trunks, 'name', 'trunkid') === $stableNamesBefore, 'provider host changes must not create duplicate trunks or change names/IDs');
 activation_assert($stableRouting->addCalls === 1, 'provider host changes must not recreate the existing outbound route');
 activation_cleanup($directory);
@@ -1015,10 +1070,12 @@ $failedMigrationCore->seedManagedTrunk('legacy-out.example.invalid', 5060, ['aut
 $beforeFailedMigration = [$failedMigrationCore->trunks, $failedMigrationCore->details];
 $failedMigrationCore->failEdit = true;
 $failedMigrationModule = new ActivationContractModule($directory, [activation_fixture_response()], $failedMigrationCore);
+activation_assert(!$failedMigrationModule->activate('synthetic-test-token')['success'] && $failedMigrationCore->editCalls === 0, 'unowned migration must stop before invoking Core edit');
+activation_adopt_current($failedMigrationModule);
 activation_assert(!$failedMigrationModule->activate('synthetic-test-token')['success'], 'Core edit failure must leave migration pending');
 activation_assert([$failedMigrationCore->trunks, $failedMigrationCore->details] === $beforeFailedMigration, 'failed in-place edit must roll back rather than lose the existing trunk');
 $failedMigrationCore->failEdit = false;
-activation_assert($failedMigrationModule->activate('synthetic-test-token')['success'] && count($failedMigrationModule->requests()) === 2, 'failed migration should retry with refreshed authorization');
+activation_assert($failedMigrationModule->activate('synthetic-test-token')['success'] && count($failedMigrationModule->requests()) === 3, 'failed owned migration should retry with refreshed authorization after the initial adoption-required attempt');
 activation_cleanup($directory);
 
 $directory = activation_temp_directory();

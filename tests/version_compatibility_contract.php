@@ -21,7 +21,7 @@ $xml = file_get_contents($root . '/module.xml');
 compatibility_assert($xml !== false && $xml !== '', 'module.xml should be readable');
 compatibility_assert(xml_first($xml, 'rawname') === 'domaintains', 'raw module name should be domaintains');
 compatibility_assert(xml_first($xml, 'name') === 'DOMAINTAINS', 'display name should be DOMAINTAINS');
-compatibility_assert(xml_first($xml, 'version') === '0.3.5-dev', 'module version should be 0.3.5-dev');
+compatibility_assert(xml_first($xml, 'version') === '0.4.0-dev', 'module version should be 0.4.0-dev');
 compatibility_assert(xml_first($xml, 'publisher') === 'FreePBX UK', 'publisher should be FreePBX UK');
 compatibility_assert(xml_first($xml, 'license') === 'GPLv3+', 'module licence metadata should be GPLv3+');
 
@@ -57,6 +57,12 @@ foreach ($productionFiles as $file) {
 $readme = file_get_contents($root . '/README.md');
 $moduleClass = file_get_contents($root . '/Domaintains.class.php');
 $consoleClass = file_get_contents($root . '/Console/Domaintains.class.php');
+
+compatibility_assert((bool)preg_match("/const VERSION = '([^']+)'/", $moduleClass, $versionMatch) && $versionMatch[1] === xml_first($xml, 'version'), 'class fallback version must match module.xml');
+compatibility_assert(strpos($readme, '`' . xml_first($xml, 'version') . '`') !== false, 'README current version must match module.xml');
+if (function_exists('simplexml_load_string')) {
+	compatibility_assert(simplexml_load_string($xml) !== false, 'module.xml must be well-formed XML');
+}
 
 compatibility_assert(strpos($readme, 'FreePBX 16 and 17') !== false, 'README compatibility should cover FreePBX 16 and 17');
 compatibility_assert(strpos($moduleClass, 'FreePBX 16 and 17') !== false, 'module documentation should identify FreePBX 16 and 17 support');

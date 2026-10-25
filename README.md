@@ -28,14 +28,15 @@ DOMAINTAINS may manage its own:
 - inbound and outbound SIP trunks;
 - inbound routes for provider-authorised numbers;
 - outbound routing where applicable;
-- FreePBX Firewall configuration needed for provider access, where applicable;
 - provider-authorised channel limits on managed trunks;
 - FreePBX reload notifications when changes require them.
 
-These are DOMAINTAINS-owned objects associated with the activated service.
-Unrelated administrator-created trunks, routes and other configuration are not
-supposed to be silently adopted or overwritten. If ownership is ambiguous or an
-existing object conflicts, the module fails closed rather than guessing.
+Newly created and verified objects are recorded in a separate ownership ledger.
+Pre-existing objects may be referenced or reused only when they already exactly
+match the required state. Reuse is not ownership: an unowned object is never
+updated, normalized, deleted/recreated or otherwise mutated. Safe legacy trunks
+requiring changes fail closed with an explicit ownership-adoption instruction.
+Conflicting or ambiguous objects are not adopted. See **Durable Object Ownership**.
 
 ## What Happens When I Activate It?
 
@@ -52,10 +53,11 @@ In plain terms:
 
 When Activate is run again with the existing activation authorization,
 DOMAINTAINS refreshes the provider-authorised configuration and reconciles
-module-owned objects. If someone manually changes a setting on a managed object,
-a later refresh may restore the authorised value. For example, a manually changed `maxchans`
-limit on a DOMAINTAINS trunk can be repaired from the provider-authorised channel
-limit.
+module-owned objects only when their current configuration matches recorded
+ownership evidence. Unexpected administrator changes fail closed; the module does
+not overwrite them or silently recapture their fingerprints. A provider-authorised
+change, such as a new channel limit, can be reconciled when the current owned
+trunk still matches its recorded fingerprint.
 
 This applies to DOMAINTAINS-owned objects; it does not mean the module
 arbitrarily rewrites unrelated FreePBX configuration. Conflicts with other
@@ -86,11 +88,13 @@ mode `0600`. Root `fwconsole` operations normalise ownership to the Asterisk
 runtime account so the FreePBX web runtime can read the same state. Atomic writes
 preserve these ownership and permission protections.
 
-The module requires PHP sodium and HTTPS support. To activate in FreePBX, open
-**Connectivity > DOMAINTAINS**, enter the token supplied by your provider, and
-select **Activate**. The CLI also supports activation:
+The module requires PHP sodium and HTTPS support. In **Connectivity > DOMAINTAINS**,
+save the complete HTTPS provisioning endpoint supplied by your operator, then
+enter the activation token and select **Activate**. There is no default endpoint.
+The CLI supports scriptable endpoint configuration and interactive activation:
 
 ```sh
+fwconsole domaintains endpoint https://control.example.invalid/activate
 fwconsole domaintains activate
 ```
 
@@ -111,7 +115,8 @@ routes, numbers or other provisioned configuration:
 fwconsole domaintains deactivate
 ```
 
-Deactivation removes only the retained activation state. Status then reports
+Deactivation removes only the retained activation state. The separately stored
+provisioning endpoint and ownership ledger also survive. Status then reports
 `unprovisioned`; existing PBX configuration remains and calls may still work.
 It does not cancel a provider-side service or revoke upstream authorization.
 
@@ -147,7 +152,47 @@ public integration boundary; everything behind the service is implementation-
 specific.
 
 The project is under active development. The current module version is
-`0.3.5-dev`.
+`0.4.0-dev`.
+
+## 0.4.0-dev Milestone
+
+This is an architectural milestone, prepared for controlled testing on FreePBX
+17. Live testing has not yet been completed; this development release is not
+production-ready.
+
+Implemented in this release:
+
+- An administrator-configured, provider-neutral complete HTTPS provisioning
+  endpoint, replacing the hard-coded service with no default or fallback.
+- A durable ownership ledger using native FreePBX object identifiers, with
+  ownership recorded only after creation has been verified.
+- Explicit administrator-confirmed adoption of safely identified legacy
+  configuration, without changing the adopted objects.
+- Protection against unauthorised mutation or deletion of unowned objects;
+  exactly matching unowned objects may be reused without becoming owned.
+- Ownership fingerprint verification and interrupted-operation recovery,
+  including local recovery of verified pending ownership evidence.
+- Ownership-protected internal configuration teardown, with verified absence
+  and durable retry handling; there is no public deletion command.
+- Removal of automatic FreePBX Firewall management. Firewall trust remains the
+  responsibility of the operator's provisioning infrastructure.
+- Preservation of signing identity, endpoint settings, ownership state and
+  existing PBX configuration across local Deactivate.
+- Expanded regression coverage for endpoint configuration, ownership,
+  adoption, teardown, native rollback and interrupted finalisation.
+
+Not implemented in this release:
+
+- Remote Rotate/Revoke or event-driven lifecycle delivery.
+- Provider-neutral service identity; the existing hostname-derived
+  `my-[0-9]{8}` service identity contract remains unchanged.
+- Selective per-resource teardown; the internal primitive processes recorded
+  owned configuration subject to its safety and reference checks.
+- Authoritative lifecycle revision handling.
+
+These remain future work. This release introduces no cron, polling, background
+service or inbound lifecycle listener. The existing UK outbound-routing policy
+also remains unchanged.
 
 ## Architecture
 
@@ -186,9 +231,150 @@ then let the PBX activate against the compatible service. These are conceptual
 examples; the module does not call billing, number, DNS or SIP infrastructure
 APIs directly.
 
-The current activation endpoint is defined at module level rather than exposed
-as a FreePBX setting. A deployment using a different compatible service must
-integrate that service at the module's activation endpoint boundary.
+The provisioning endpoint is administrator-selected. It represents a compatible
+operator provisioning/authorisation control service, not a SIP server. SIP-edge
+and routing control are separate operator integration boundaries. Successful
+local provisioning is not proof of SIP routing authority or upstream teardown.
+
+## Provisioning Endpoint Configuration
+
+Configure the **complete activation endpoint URL**, not a service base URL.
+DOMAINTAINS sends the existing signed activation request directly to that URL;
+it does not append or infer a path. The URL must use HTTPS and a valid DNS
+hostname, with no embedded credentials, fragment, whitespace or malformed URL
+encoding. Optional explicit ports and query strings are retained unchanged.
+Do not put credentials or activation tokens in the URL.
+
+Use the GUI's **Provisioning endpoint** setting, or scriptable CLI commands:
+
+```sh
+fwconsole domaintains endpoint https://control.example.invalid/activate --no-interaction
+fwconsole domaintains endpoint --json
+```
+
+There is no provider-specific default, hidden fallback, hostname inference or
+automatic migration from the former embedded URL. Existing provisioned
+installations continue using their retained local configuration and status
+without configuring an endpoint immediately. Activate and Reactivate require
+an endpoint before provider communication can proceed.
+
+Saving or changing the endpoint changes only where future provider operations
+are sent. It does not contact the provider, unlink authorization, replace the
+signing identity, change PBX objects or claim upstream service changes. Choosing
+a different endpoint changes the service trusted with the next signed bootstrap
+request; administrators must verify that endpoint independently. Ordinary
+Activate identity protection and explicit Reactivate replacement remain intact.
+
+Provisioning service communication is outbound HTTPS. Configuring or using the
+endpoint does not add its hostname to FreePBX Firewall Internal, Local or Trusted
+zones, and does not otherwise grant inbound trust. Saving or changing an
+endpoint, Activate, Reactivate and teardown leave existing Firewall configuration
+untouched, including entries left by earlier versions. No replacement whitelist
+mechanism is used. SIP-edge/provider inbound access, if ever required, is a
+separate explicit BYOT integration capability needing a documented purpose and
+least-privilege design; it is not part of the provisioning endpoint contract.
+
+## Durable Object Ownership
+
+Runtime storage remains `/var/lib/asterisk/domaintains`, mode `0700`, with
+Asterisk-owned sensitive files at `0600`, including root `fwconsole` writes:
+
+| Store | Purpose |
+| --- | --- |
+| `signing.key` | Persistent PBX signing identity. |
+| `state.json` | Retained provider authorization and desired configuration; removed by local Deactivate. |
+| `ownership.json` | Durable verified object identities, configuration digests, recording time and created/adopted origin. |
+| `endpoint.json` | Administrator-selected provisioning endpoint. |
+| `test-destination.json` | Module-local test destination registration. |
+
+Endpoint and ownership writes share the activation lock, permission/ownership
+normalization and atomic replacement protections. Symlinks, non-regular files
+and malformed retained records fail closed rather than being overwritten.
+Configuration digests do not retain plaintext SIP credentials.
+
+The ledger uses FreePBX's real identifiers:
+
+- PJSIP trunk: `trunks.trunkid`, also used by the PJSIP detail API.
+- Inbound route: `incoming` primary-key tuple `(extension, cidnum)`; there is no
+  invented numeric DID identifier. Current managed routes have empty `cidnum`.
+- Outbound route: `outbound_routes.route_id`, including its verified patterns
+  and trunk references in the configuration digest.
+- Test destination: the module-local registration for `domaintains-test,s,1`,
+  not a fictitious FreePBX database row.
+
+Creation is read back and verified before ownership is recorded. A crash or
+storage failure before recording leaves an object unowned, never inferred owned.
+An activation can be pending while ownership of earlier successful creations is
+already durable. Losing the ledger does not authorize name-based reconstruction.
+
+For legacy installations, run this while valid retained authorization and safely
+identifiable existing configuration are available, including after activation
+stops because a legacy trunk requires adoption before normalization:
+
+```sh
+fwconsole domaintains adopt
+```
+
+The command displays each candidate's type, actual native identifier, label,
+already-owned status and current trunk settings without revealing credentials.
+Safe legacy trunk candidates use the existing controlled migration rules and
+unambiguous identity mapping; candidate matching is not broadened. Existing
+inbound and outbound routes must still match the expected policy, and absent
+objects are not proposed. Preview never mutates candidates.
+
+Interactive confirmation defaults to no and `--no-interaction` is refused.
+The preview is reverified under the module lock, then ownership of the exact
+object and its current configuration is recorded without normalization. Only a
+subsequent Activate/Reactivate may reconcile that now-owned trunk. Changed
+candidates, ambiguous trunk mappings, conflicting routes or damaged state
+prevent adoption. Repeating adoption is harmless. Unrelated objects and Firewall
+entries are excluded. If already locally deactivated, Activate first to restore
+retained authorization (possibly pending adoption), then review adoption explicitly.
+
+The protected internal teardown primitive has no GUI, CLI or HTTP deletion
+entry point. It checks ledger identities and recorded effective configuration,
+refuses changed/ambiguous objects and unowned outbound routes referencing owned
+trunks, then deletes owned outbound routes, inbound routes and trunks through
+native APIs. Already-absent objects count as absent. Entries are removed only
+after absence is verified; failed deletes retain them for retry. Signing identity,
+endpoint and unowned objects remain. Test registration is retained while an
+unowned inbound route still references it. Starting teardown marks retained
+activation pending and requests a FreePBX reload notification, not upstream
+service revocation.
+
+Trunk normalization preserves the native trunk ID and existing dial options. It
+replaces only that trunk's PJSIP detail rows inside the SQL transaction before
+calling the native trunk writer in edit mode. It does not invoke native trunk
+deletion, its deletion hooks, conversion-metadata removal or AstDB deletion.
+The native writer receives the unchanged dial options. SQL rollback is not
+assumed to reverse AstDB operations or external hooks: the full original trunk
+fingerprint is rechecked after rollback. If restoration cannot be verified,
+activation remains pending with an explicit administrator-review diagnostic;
+ownership is not recaptured and unexpected configuration is not overwritten.
+
+A verified post-edit digest is saved as `pending_fingerprint` before commit.
+Recovery accepts only the recorded original or pending digest, never an arbitrary
+third configuration. Protected teardown settles that evidence durably under the
+module lock before deleting anything, including after local Deactivate. Adoption
+preview accepts verified pending evidence without changing the ledger; confirmed
+adoption revalidates the preview and settles the digest without editing native
+objects. These local recovery paths do not contact the provider. Failed ledger
+writes retain the evidence for retry and prevent teardown from starting deletion.
+
+FreePBX's inspected APIs do not expose immutable object-generation tokens.
+Native identity plus the verified configuration digest detects reuse with
+different configuration, but cannot distinguish an externally deleted object
+from an identically recreated object using the same native key. The module lock
+serializes DOMAINTAINS operations, not unrelated administrator/API writes.
+Real-system review must account for those limits; changed objects fail closed
+and must not be force-adopted to bypass a teardown conflict.
+
+Future last-applied authoritative revision/status must use its own protected
+lifecycle store, separate from activation, ownership and endpoint configuration,
+and survive local Deactivate. This release does not create speculative lifecycle
+fields. Provider event transport, remote Rotate/Revoke delivery and authoritative
+revision handling remain subsequent work. This machinery uses **no cron polling**
+and starts no background process or inbound HTTP listener.
 
 ## Activation Model
 
@@ -205,8 +391,8 @@ The public activation lifecycle is:
   for its service.
 9. The service returns authorised PBX configuration.
 10. DOMAINTAINS reconciles and verifies that state through local FreePBX APIs.
-11. Later activation/refresh operations fetch current authorised state and repair
-    module-owned drift.
+11. Later activation/refresh operations fetch current authorised state and
+  reconcile owned objects whose current fingerprints still verify.
 
 The module requires PHP sodium and HTTPS support. Ordinary activation preserves
 the retained activation identity; explicit reactivation permits replacement
@@ -260,22 +446,23 @@ can include:
 - managed inbound and outbound PJSIP trunks;
 - exact inbound routes for authorised numbers;
 - an outbound route using authorised outbound trunks, where applicable;
-- the configured activation host in the FreePBX Firewall internal zone;
 - the provider-authorised channel limit on each managed trunk;
 - a FreePBX reload notification and final local verification.
 
 During refresh, a changed authorised channel limit or other managed setting is
-reconciled through FreePBX APIs. Unrelated trunks and routes are left alone;
-ambiguous ownership or administrator conflicts fail closed rather than being
-silently replaced.
+reconciled through FreePBX APIs only for owned objects. Exactly matching unowned
+objects may be reused without mutation; a safe unowned trunk needing changes
+requires explicit adoption first. Unrelated trunks, routes and Firewall settings
+are left alone; ambiguous ownership or administrator conflicts fail closed.
 
 ## Channel Limits
 
 The provisioning service returns `max_channels` as an integer from 1 through
-500. DOMAINTAINS applies that authorised value to its managed trunks and repairs
-manual `maxchans` drift on those trunks during refresh. It does not calculate
-or infer billing entitlement. Any policy used to determine the value belongs
-behind the provisioning service.
+500. DOMAINTAINS applies changes to that authorised value only when the current
+owned trunk matches its recorded ownership fingerprint. Unexpected manual
+`maxchans` changes fail closed rather than being automatically repaired. The
+module does not calculate or infer billing entitlement. Any policy used to
+determine the value belongs behind the provisioning service.
 
 ## Building a Compatible Provisioning Service
 
