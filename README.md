@@ -152,13 +152,31 @@ public integration boundary; everything behind the service is implementation-
 specific.
 
 The project is under active development. The current module version is
-`0.4.0-dev`.
+`0.4.1-dev`.
+
+## 0.4.1-dev Security Patch
+
+This patch hardens the 0.4.0 development baseline without adding features or
+changing state formats. It validates SIP DNS names and IPv4/IPv6 addresses,
+rejects configuration-injection characters, brackets native IPv6 SIP addresses,
+aborts provisioning responses above 1 MiB, and enforces documented entitlement
+counts and string lengths. Root DOMAINTAINS commands switch permanently to the
+Asterisk account before module access, and storage helpers refuse effective-root
+access. Signing keys and correctly owned activation, endpoint and ownership
+records require no migration. Local Deactivate and Firewall behaviour are unchanged.
+
+The preceding baseline has been tested on a provisioned FreePBX 17 installation
+with six adopted objects. That does not constitute live validation of this
+security patch; its privilege boundary and native IPv6 behaviour still require
+controlled FreePBX 16/17 integration testing. This is not a production release.
+BYOT integration is reserved for `0.5.0-dev`; reference handoffs are separate
+artifacts and are not included in this security patch.
 
 ## 0.4.0-dev Milestone
 
-This is an architectural milestone, prepared for controlled testing on FreePBX
-17. Live testing has not yet been completed; this development release is not
-production-ready.
+This architectural milestone established the baseline for controlled FreePBX
+testing. Its scope is retained below as historical context, not as new features
+in the security patch.
 
 Implemented in this release:
 
@@ -277,7 +295,7 @@ least-privilege design; it is not part of the provisioning endpoint contract.
 ## Durable Object Ownership
 
 Runtime storage remains `/var/lib/asterisk/domaintains`, mode `0700`, with
-Asterisk-owned sensitive files at `0600`, including root `fwconsole` writes:
+Asterisk-owned sensitive files at `0600`, including commands invoked from root:
 
 | Store | Purpose |
 | --- | --- |
@@ -291,6 +309,15 @@ Endpoint and ownership writes share the activation lock, permission/ownership
 normalization and atomic replacement protections. Symlinks, non-regular files
 and malformed retained records fail closed rather than being overwritten.
 Configuration digests do not retain plaintext SIP credentials.
+
+Before accessing the module, root `fwconsole domaintains` commands permanently
+switch supplementary groups, group ID and user ID to the existing `asterisk`
+account. Failure to switch stops the command without accessing module state.
+Storage helpers independently refuse effective-root access; custom root-run
+callers must use the unprivileged runtime instead. No directory ownership
+migration or signing-key replacement is performed. Existing correctly owned
+stores remain compatible. Incorrectly root-owned legacy files require explicit
+administrator inspection and repair, not automatic privileged pathname changes.
 
 The ledger uses FreePBX's real identifiers:
 
@@ -425,11 +452,30 @@ provider metadata.
 | Field | Required value |
 | --- | --- |
 | `service` | Non-empty service identity matching the PBX's local identity and `^my-[0-9]{8}$`. |
-| `profile` | Non-empty provider-defined string; its meaning is not interpreted by the PBX module. |
-| `domaintains_hostname` | Non-empty string supplied as part of the authorised service configuration. |
-| `trunks` | Non-empty list of unique trunk entries. Each entry has `role` (`inbound` or `outbound`), non-empty `sip_host`, and integer `sip_port` from 1 through 65535. |
-| `numbers` | List of unique numeric strings authorised for the service. |
+| `profile` | Non-empty provider-defined string, at most 1,024 bytes; its meaning is not interpreted by the PBX module. |
+| `domaintains_hostname` | Non-empty string, at most 1,024 bytes, supplied as part of the authorised service configuration. |
+| `trunks` | 1 through 64 unique trunk entries. Each entry has `role` (`inbound` or `outbound`), validated `sip_host`, and integer `sip_port` from 1 through 65535. |
+| `numbers` | At most 10,000 unique numeric strings, each containing 1 through 32 digits. An empty list remains valid. |
 | `max_channels` | Provider-authorised JSON integer from 1 through 500 inclusive. |
+
+Responses are limited to 1 MiB (1,048,576 bytes), including unrelated metadata
+and whitespace. The HTTPS write callback aborts the transfer before appending
+an excessive chunk. Oversized transfers fail even if their received prefix is
+valid JSON; truncated JSON is never accepted.
+
+SIP hosts may be ASCII DNS hostnames (including single-label names, punycode and
+an optional trailing root dot), IPv4 addresses, or bare/bracketed IPv6 addresses.
+DNS labels are at most 63 bytes and names at most 253 bytes excluding the root
+dot. Whitespace, controls, URI syntax, embedded ports, scoped IPv6 zone IDs and
+configuration delimiters are rejected. Native settings bracket bare IPv6 for
+FreePBX's SIP URI generation; the original provider host is retained for trunk
+identity calculations. Existing DNS/IPv4 settings and identity hashes are unchanged.
+
+These limits also validate retained authorization. Out-of-limit legacy records
+fail closed without deleting their keys, configuration, endpoint or ownership
+ledger; arrange compliant entitlements before upgrading such installations.
+Invalid remote responses do not replace retained authorization or change PBX
+objects. No security hardening changes local Deactivate or Firewall behaviour.
 
 The provisioning service supplies the final `max_channels` value. DOMAINTAINS
 validates and enforces it; the PBX module does not calculate commercial
@@ -529,6 +575,43 @@ require carrier credentials and does not call a number provider directly.
 - Provider infrastructure remains the provider's security perimeter. Local
   root access can alter a PBX, so provider-side activation, entitlement and
   upstream enforcement remain authoritative.
+
+The former root pathname-race concern requires a process already able to modify
+Asterisk-owned storage while a privileged caller accesses it. Dropping CLI
+privileges and refusing root storage access remove that privileged module path;
+they do not isolate state from a compromised Asterisk account. Pathname checks
+and the module lock are not a defence against arbitrary same-account code or
+external administrator writes. Live FreePBX 16/17 privilege-transition and
+activation testing remains required; synthetic tests do not prove deployment
+permissions, terminal behaviour or native integration.
+
+### 0.4.1 Privilege Compatibility Review
+
+Source inspection of FreePBX framework `release/16.0` and `release/17.0`
+(`amp_conf/bin/fwconsole`, `FWApplication.class.php`, `Console/Moduleadmin.class.php`
+and `modulefunctions.class.php`) confirms that command loading and module
+installation are separate from a DOMAINTAINS command's `execute()` method.
+Module Admin may need root for its own installation/ownership work; its old
+privilege-drop block is commented out and is not relied upon here. DOMAINTAINS
+construction, command configuration, BMO `install()` and the install script
+neither drop privileges nor access module state. The installer is unaffected.
+
+The privilege transition remains at the start of DOMAINTAINS command execution,
+before status, endpoint operations, prompts, provider calls or PBX mutations.
+Failures stop before module access, including partial group/user transitions.
+These actions use the same runtime-accessible APIs and stores as the GUI and
+do not perform unrelated root-only installation, service or ownership work.
+Programmatic callers that need root work afterwards must invoke DOMAINTAINS in
+a separate process; the UID transition is intentionally permanent.
+
+Isolated tests cover all console actions and migration-free preservation of a
+synthetic six-adopted-object installation. Disposable root-container tests verify
+the real UID/GID transition, retained signing keys and endpoint access. The actual
+vendored Symfony hidden-input and terminal checks from both branches also pass
+on a root-created pseudo-terminal after the transition, without echoing the
+synthetic token and with terminal mode restored. These tests do not replace a
+live upgrade and activation on the provisioned PBX or exercise its other modules,
+custom shutdown hooks, distribution-specific permissions or native IPv6 routing.
 
 Provider/backend credentials for billing, carrier, DNS, and SBC management
 should remain provider-side and must not be exposed to the PBX. Requirements for

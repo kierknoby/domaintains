@@ -13,10 +13,15 @@ namespace FreePBX\modules;
 class Domaintains implements \BMO {
 
 	/** Fallback only. Authoritative version lives in module.xml. */
-	const VERSION = '0.4.0-dev';
+	const VERSION = '0.4.1-dev';
 	const TRUNK_NAME = 'DOMAINTAINS';
 	const ROUTE_NAME = 'DOMAINTAINS-Outbound';
 	const TEST_DESTINATION = 'domaintains-test,s,1';
+	const MAX_RESPONSE_BYTES = 1048576;
+	const MAX_AUTHORIZED_TRUNKS = 64;
+	const MAX_AUTHORIZED_NUMBERS = 10000;
+	const MAX_NUMBER_DIGITS = 32;
+	const MAX_PROVISIONING_TEXT_BYTES = 1024;
 
 	/** @var \FreePBX */
 	private $FreePBX;
@@ -539,6 +544,7 @@ class Domaintains implements \BMO {
 	}
 
 	private function ensureStorageDirectory(): void {
+		$this->assertUnprivilegedStorageAccess();
 		$directory = $this->storageDirectory();
 		if (is_link($directory)) {
 			throw new \RuntimeException('Activation storage must not be a symbolic link.');
@@ -557,7 +563,14 @@ class Domaintains implements \BMO {
 		return [(int)$account['uid'], (int)$account['gid']];
 	}
 
+	private function assertUnprivilegedStorageAccess(): void {
+		if (!function_exists('posix_geteuid') || posix_geteuid() === 0) {
+			throw new \RuntimeException('Module storage requires unprivileged runtime access. Use fwconsole domaintains to switch to the Asterisk account.');
+		}
+	}
+
 	private function secureStoragePath(string $path, int $mode, bool $directory = false): void {
+		$this->assertUnprivilegedStorageAccess();
 		if (is_link($path) || ($directory ? !is_dir($path) : !is_file($path))) {
 			throw new \RuntimeException('Invalid secure storage path.');
 		}
@@ -699,6 +712,9 @@ class Domaintains implements \BMO {
 	}
 
 	private function validateActivationResponse(string $response, string $localService): array {
+		if (strlen($response) > self::MAX_RESPONSE_BYTES) {
+			throw new \RuntimeException('Invalid activation response.');
+		}
 		$decoded = json_decode($response);
 		if (json_last_error() !== JSON_ERROR_NONE || !is_object($decoded) || !isset($decoded->ok) || $decoded->ok !== true) {
 			throw new \RuntimeException('Invalid activation response.');
@@ -723,7 +739,7 @@ class Domaintains implements \BMO {
 			$values[$field] = $data[$field];
 		}
 		foreach (['service', 'profile', 'domaintains_hostname'] as $field) {
-			if (!is_string($values[$field]) || trim($values[$field]) === '') {
+			if (!is_string($values[$field]) || trim($values[$field]) === '' || strlen($values[$field]) > self::MAX_PROVISIONING_TEXT_BYTES) {
 				throw new \RuntimeException('Activation state has an invalid local field.');
 			}
 		}
@@ -734,12 +750,12 @@ class Domaintains implements \BMO {
 			throw new \RuntimeException('Activation state has an invalid channel entitlement.');
 		}
 		$values['trunks'] = $this->validateAuthorizedTrunks($values['trunks']);
-		if (!is_array($values['numbers']) || array_values($values['numbers']) !== $values['numbers']) {
+		if (!is_array($values['numbers']) || count($values['numbers']) > self::MAX_AUTHORIZED_NUMBERS || array_values($values['numbers']) !== $values['numbers']) {
 			throw new \RuntimeException('Authorized numbers must be a list.');
 		}
 		$seenNumbers = [];
 		foreach ($values['numbers'] as $number) {
-			if (!is_string($number) || !preg_match('/^[0-9]+$/D', $number) || isset($seenNumbers[$number])) {
+			if (!is_string($number) || strlen($number) > self::MAX_NUMBER_DIGITS || !preg_match('/^[0-9]+$/D', $number) || isset($seenNumbers[$number])) {
 				throw new \RuntimeException('Invalid or duplicate authorized number.');
 			}
 			$seenNumbers[$number] = true;
@@ -747,14 +763,35 @@ class Domaintains implements \BMO {
 		return $values;
 	}
 
+	private function validSipHost(string $host): bool {
+		if ($host === '' || strlen($host) > 254 || preg_match('/[\x00-\x20\x7f]/', $host)) {
+			return false;
+		}
+		$address = $host;
+		if ($host[0] === '[' && substr($host, -1) === ']') {
+			$address = substr($host, 1, -1);
+			return filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
+		}
+		if (filter_var($address, FILTER_VALIDATE_IP) !== false) {
+			return true;
+		}
+		$hostname = substr($host, -1) === '.' ? substr($host, 0, -1) : $host;
+		return $hostname !== '' && substr($hostname, -1) !== '.' && strlen($hostname) <= 253
+			&& !preg_match('/^[0-9.]+$/D', $hostname)
+			&& filter_var($hostname, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) !== false;
+	}
+
 	private function validateAuthorizedTrunks(array $trunks): array {
+		if (count($trunks) > self::MAX_AUTHORIZED_TRUNKS) {
+			throw new \RuntimeException('Activation response contains too many authorized trunks.');
+		}
 		$validated = [];
 		$seen = [];
 		foreach ($trunks as $trunk) {
 			if (is_object($trunk)) {
 				$trunk = (array)$trunk;
 			}
-			if (!is_array($trunk) || !isset($trunk['role'], $trunk['sip_host'], $trunk['sip_port']) || !is_string($trunk['role']) || !in_array($trunk['role'], ['inbound', 'outbound'], true) || !is_string($trunk['sip_host']) || trim($trunk['sip_host']) === '' || !is_int($trunk['sip_port']) || $trunk['sip_port'] < 1 || $trunk['sip_port'] > 65535) {
+			if (!is_array($trunk) || !isset($trunk['role'], $trunk['sip_host'], $trunk['sip_port']) || !is_string($trunk['role']) || !in_array($trunk['role'], ['inbound', 'outbound'], true) || !is_string($trunk['sip_host']) || !$this->validSipHost($trunk['sip_host']) || !is_int($trunk['sip_port']) || $trunk['sip_port'] < 1 || $trunk['sip_port'] > 65535) {
 				throw new \RuntimeException('Activation response contains an invalid authorized trunk.');
 			}
 			$identity = json_encode([$trunk['role'], $trunk['sip_host'], $trunk['sip_port']], JSON_UNESCAPED_SLASHES);
@@ -1163,6 +1200,10 @@ class Domaintains implements \BMO {
 
 	private function desiredTrunkSettings(array $authorizedTrunk, int $maxChannels): array {
 		$trunkName = $this->resolvedManagedTrunkName($authorizedTrunk);
+		$sipServer = $authorizedTrunk['sip_host'];
+		if (filter_var($sipServer, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false) {
+			$sipServer = '[' . $sipServer . ']';
+		}
 		return [
 			'channelid' => $trunkName,
 			'trunk_name' => $trunkName,
@@ -1179,7 +1220,7 @@ class Domaintains implements \BMO {
 			'provider' => '',
 			'continue' => 'off',
 			'dialopts' => false,
-			'sip_server' => $authorizedTrunk['sip_host'],
+			'sip_server' => $sipServer,
 			'sip_server_port' => (string)$authorizedTrunk['sip_port'],
 			'context' => 'from-pstn',
 			'sendrpid' => 'no',
@@ -1670,6 +1711,7 @@ class Domaintains implements \BMO {
 	}
 
 	private function writeSecureFile(string $path, string $contents): void {
+		$this->assertUnprivilegedStorageAccess();
 		if (is_link($path) || (file_exists($path) && !is_file($path))) {
 			throw new \RuntimeException('Invalid secure storage path.');
 		}
@@ -1704,11 +1746,22 @@ class Domaintains implements \BMO {
 		if ($handle === false) {
 			throw new \RuntimeException('Unable to initialize HTTPS request.');
 		}
+		$response = '';
+		$oversized = false;
 		$optionsSet = curl_setopt_array($handle, [
 			CURLOPT_POST => true,
 			CURLOPT_POSTFIELDS => $request,
 			CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json'],
-			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_RETURNTRANSFER => false,
+			CURLOPT_WRITEFUNCTION => function ($handle, string $chunk) use (&$response, &$oversized): int {
+				$length = strlen($chunk);
+				if ($length > self::MAX_RESPONSE_BYTES - strlen($response)) {
+					$oversized = true;
+					return 0;
+				}
+				$response .= $chunk;
+				return $length;
+			},
 			CURLOPT_CONNECTTIMEOUT => 10,
 			CURLOPT_TIMEOUT => 30,
 			CURLOPT_SSL_VERIFYPEER => true,
@@ -1718,11 +1771,11 @@ class Domaintains implements \BMO {
 			curl_close($handle);
 			throw new \RuntimeException('Unable to configure HTTPS request.');
 		}
-		$response = curl_exec($handle);
+		$completed = curl_exec($handle);
 		$statusCode = (int)curl_getinfo($handle, CURLINFO_HTTP_CODE);
 		$curlError = curl_errno($handle);
 		curl_close($handle);
-		if ($curlError !== 0 || !is_string($response) || $statusCode < 200 || $statusCode >= 300) {
+		if ($oversized || $completed !== true || $curlError !== 0 || $statusCode < 200 || $statusCode >= 300) {
 			throw new \RuntimeException('Invalid HTTPS response.');
 		}
 		return $response;

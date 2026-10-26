@@ -27,6 +27,11 @@ class Domaintains extends Command {
 	}
 
 	protected function execute(InputInterface $input, OutputInterface $output) {
+		try {
+			$this->dropRootPrivileges();
+		} catch (\Throwable $e) {
+			return $this->outputResult(['success' => false, 'message' => 'Unable to switch securely to the Asterisk runtime account. No module state was accessed.'], $input, $output);
+		}
 		$action = strtolower(trim((string)$input->getArgument('action')));
 		if ($action === '') {
 			$action = 'status';
@@ -142,6 +147,24 @@ class Domaintains extends Command {
 		$output->writeln('FreePBX support: ' . implode(' and ', $status['freepbx_support']));
 
 		return 0;
+	}
+
+	private function dropRootPrivileges(): void {
+		if (!function_exists('posix_geteuid')) {
+			throw new \RuntimeException('POSIX support is required.');
+		}
+		if (posix_geteuid() !== 0) {
+			return;
+		}
+		$account = posix_getpwnam('asterisk');
+		if (!is_array($account) || !isset($account['uid'], $account['gid']) || (int)$account['uid'] <= 0 || (int)$account['gid'] <= 0
+			|| !function_exists('posix_initgroups') || !function_exists('posix_setgid') || !function_exists('posix_setuid')
+			|| !posix_initgroups('asterisk', (int)$account['gid'])
+			|| !posix_setgid((int)$account['gid']) || !posix_setuid((int)$account['uid'])
+			|| posix_getuid() !== (int)$account['uid'] || posix_geteuid() !== (int)$account['uid']
+			|| posix_getgid() !== (int)$account['gid'] || posix_getegid() !== (int)$account['gid']) {
+			throw new \RuntimeException('Unable to drop root privileges.');
+		}
 	}
 
 	private function outputResult(array $result, InputInterface $input, OutputInterface $output): int {
