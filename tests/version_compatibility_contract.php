@@ -21,7 +21,9 @@ $xml = file_get_contents($root . '/module.xml');
 compatibility_assert($xml !== false && $xml !== '', 'module.xml should be readable');
 compatibility_assert(xml_first($xml, 'rawname') === 'domaintains', 'raw module name should be domaintains');
 compatibility_assert(xml_first($xml, 'name') === 'DOMAINTAINS', 'display name should be DOMAINTAINS');
-compatibility_assert(xml_first($xml, 'version') === '0.5.0-dev', 'module version should be 0.5.0-dev');
+compatibility_assert(xml_first($xml, 'version') === '0.6.0-dev', 'module version should be 0.6.0-dev');
+compatibility_assert(strpos($xml, '*0.6.0-dev* Adds operator-side provider-neutral emergency registration') !== false, 'emergency release history should identify 0.6.0-dev');
+compatibility_assert(strpos($xml, '*0.5.0-dev* Adds persistent neutral PBX identity') !== false, 'BYOT release history should retain 0.5.0-dev');
 compatibility_assert(xml_first($xml, 'publisher') === 'FreePBX UK', 'publisher should be FreePBX UK');
 compatibility_assert(xml_first($xml, 'license') === 'GPLv3+', 'module licence metadata should be GPLv3+');
 
@@ -60,6 +62,11 @@ $consoleClass = file_get_contents($root . '/Console/Domaintains.class.php');
 
 compatibility_assert((bool)preg_match("/const VERSION = '([^']+)'/", $moduleClass, $versionMatch) && $versionMatch[1] === xml_first($xml, 'version'), 'class fallback version must match module.xml');
 compatibility_assert(strpos($readme, '`' . xml_first($xml, 'version') . '`') !== false, 'README current version must match module.xml');
+compatibility_assert(strpos($readme, '## 0.6.0-dev Emergency Registration') !== false, 'README should give emergency registration its own 0.6.0-dev release section');
+compatibility_assert(strpos($readme, '## 0.5.0-dev BYOT Implementation') !== false, 'README should retain the historical BYOT release section');
+foreach (['examples/byot-provider/README.md', 'examples/byot-provider/EMERGENCY.md'] as $file) {
+	compatibility_assert(strpos(file_get_contents($root . '/' . $file), '0.6.0-dev') !== false, $file . ' should identify the emergency release as 0.6.0-dev');
+}
 if (function_exists('simplexml_load_string')) {
 	compatibility_assert(simplexml_load_string($xml) !== false, 'module.xml must be well-formed XML');
 }

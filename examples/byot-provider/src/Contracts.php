@@ -47,3 +47,30 @@ interface SipEdgeProvisioner
     public function verify(string $service, array $plan): array;
     public function removeOwned(string $service, array $identities): array;
 }
+
+interface EmergencyAuthority
+{
+    public function contexts(CustomerIdentity $customer): array;
+    public function withLease(CustomerIdentity $customer, string $service, string $pbx, ?string $numberId, callable $operation): mixed;
+}
+
+interface EmergencyBillingAdapter extends BillingAdapter
+{
+    public function withEmergencyAssignments(string $account, string $service, string $pbx, array $voices, callable $operation): mixed;
+    public function emergencyAssignment(string $account, string $service, string $pbx, string $number): string;
+}
+
+interface EmergencyRegistrationAdapter
+{
+    public function minimumInterval(): int;
+    public function rateLimits(): array;
+    public function supportsTypeChange(): bool;
+    public function retrieve(EmergencyLease $lease): array;
+    public function submit(EmergencyLease $lease, array $registration, string $revision, string $idempotencyKey): array;
+    public function status(EmergencyLease $lease): array;
+}
+
+interface CustomerAuthenticator
+{
+    public function current(): ?CustomerIdentity;
+}

@@ -2,7 +2,7 @@
 
 This is an **independent telecoms operator's HTTPS activation endpoint**, not a FreePBX module. It is designed to be bundled under `examples/byot-provider/` in the public DOMAINTAINS repository. It has no dependencies on any particular provider's billing, DNS, SIP routing or hosting infrastructure.
 
-The **0.5.0-dev** module establishes persistent neutral identities while retaining existing identities. This standalone application implements the compatible flat activation protocol plus billing/service linking, numbering, reachability, optional DNS and two independently replaceable SIP edges. The default infrastructure adapters are **simulations**, not vendor connectors. They cannot establish or prove live telephone connectivity.
+The **0.5.0-dev** BYOT foundation established persistent neutral identities while retaining existing identities. The current **0.6.0-dev** release adds provider-neutral emergency registration. This standalone application implements the compatible flat activation protocol plus billing/service linking, numbering, reachability, optional DNS and two independently replaceable SIP edges. The default infrastructure adapters are **simulations**, not vendor connectors. They cannot establish or prove live telephone connectivity.
 
 ## Directory structure
 
@@ -35,6 +35,20 @@ PHP 8.2+ with Sodium, POSIX, JSON, a local filesystem supporting `flock`/atomic 
 7. Run one of the operator workflows below and deliver a newly displayed token privately. First valid use pins the PBX public key atomically, before external operations. A key cannot be rebound by token rotation or used for a second service. An optional destination `public_key` pin can require a pre-approved key. Back up replay/key-binding state; never delete it to fix an activation.
 8. Run all tests below. Configure HTTPS with a valid certificate, no request-body logging, trusted reverse-proxy HTTPS signalling and edge/proxy throttling. The entry point never trusts client forwarding headers. Verify GET/HEAD are rejected (405), non-JSON is rejected (415), plain HTTP is rejected and bodies above 16 KiB fail.
 9. Configure `fwconsole domaintains endpoint https://provision.example/activate.php` on the disposable PBX, supply the explicit local policy below, then use the hidden `fwconsole domaintains activate` prompt. This can create/modify PBX objects. Do not run it on existing provisioned PBXs as an integration test.
+
+## Emergency Management
+
+The provider-neutral emergency capability includes an authenticated customer
+interface, replaceable registration/authority/customer-authentication adapters,
+private JSON/body-condition mapping example, current assignment checks, explicit confirmation,
+one-use form intents and persistent provider/account/number/operation quotas. Addresses and registration
+records remain provider-authoritative and are never persisted here. It is
+disabled until an operator installs authenticated customer integration and
+configures its provider and supplies an authoritative assignment adapter;
+the non-locking `LocalBilling` reference is rejected for emergency authority.
+See [EMERGENCY.md](EMERGENCY.md) for the contracts,
+working composition examples, security requirements and test commands. This
+does not modify FreePBX Emergency Caller IDs or prove live carrier acceptance.
 
 ## Operator Workflows
 

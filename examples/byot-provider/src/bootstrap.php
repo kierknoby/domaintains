@@ -9,3 +9,6 @@ require_once __DIR__ . '/LocalRegistry.php';
 require_once __DIR__ . '/Simulation.php';
 require_once __DIR__ . '/Orchestrator.php';
 require_once __DIR__ . '/Runtime.php';
+require_once __DIR__ . '/Emergency.php';
+require_once __DIR__ . '/EmergencyJsonAdapter.php';
+require_once __DIR__ . '/EmergencyApplication.php';

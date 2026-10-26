@@ -13,7 +13,7 @@ namespace FreePBX\modules;
 class Domaintains implements \BMO {
 
 	/** Fallback only. Authoritative version lives in module.xml. */
-	const VERSION = '0.5.0-dev';
+	const VERSION = '0.6.0-dev';
 	const TRUNK_NAME = 'DOMAINTAINS';
 	const ROUTE_NAME = 'DOMAINTAINS-Outbound';
 	const TEST_DESTINATION = 'domaintains-test,s,1';

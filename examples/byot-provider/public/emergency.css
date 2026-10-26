@@ -1,0 +1,28 @@
+:root { color-scheme: light; --ink: #252927; --muted: #54605c; --line: #cbd3cc; --accent: #16634d; --error: #a32525; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; color: var(--ink); background: #f5f7f6; font: 16px/1.5 "Trebuchet MS", sans-serif; letter-spacing: 0; }
+main { width: min(100% - 32px, 860px); margin: 32px auto 64px; }
+header { border-bottom: 3px solid var(--accent); padding-bottom: 12px; }
+header span { font-size: 13px; color: var(--muted); }
+h1 { margin: 4px 0; font: 32px/1.2 Georgia, serif; overflow-wrap: anywhere; }
+form, section { padding: 20px 0; border-bottom: 1px solid var(--line); }
+fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+legend { font-size: 20px; margin-bottom: 16px; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 24px; }
+.wide { grid-column: 1 / -1; }
+label { display: block; color: var(--muted); font-size: 14px; }
+input:not([type="radio"]):not([type="checkbox"]), select { display: block; width: 100%; min-height: 44px; border: 1px solid var(--line); border-radius: 3px; padding: 9px; margin-top: 4px; background: #fff; color: var(--ink); font: inherit; }
+button { min-height: 44px; max-width: 100%; margin-top: 16px; padding: 9px 15px; border: 1px solid var(--accent); border-radius: 3px; background: var(--accent); color: white; font: inherit; white-space: normal; cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .5; }
+input:focus-visible, select:focus-visible, button:focus-visible { outline: 3px solid #daae28; outline-offset: 2px; }
+.actions, .types { display: flex; gap: 12px; flex-wrap: wrap; }
+.types { margin-bottom: 16px; }
+.types label { border-bottom: 2px solid var(--line); padding: 8px 12px; color: var(--ink); }
+.types label:has(:checked) { border-color: var(--accent); background: #e6f0eb; }
+.confirmation { display: flex; align-items: flex-start; gap: 8px; margin-top: 20px; color: var(--ink); }
+.confirmation input { flex: none; margin-top: 5px; }
+#notice { min-height: 24px; overflow-wrap: anywhere; }
+#notice[data-error="true"] { color: var(--error); }
+#registration-status { font-weight: bold; }
+@media (max-width: 540px) { .grid { grid-template-columns: minmax(0, 1fr); } main { margin-top: 16px; } h1 { font-size: 27px; } }

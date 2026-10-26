@@ -5,7 +5,12 @@ return [
     'private_state_dir' => '/var/lib/domaintains-byot',
     'max_request_age' => 300,
     'simulate_dns' => true,
+    'emergency_application' => null,
     'billing' => [
+        'number_assignments' => [
+            '12025550101' => ['account' => 'account-01', 'service' => 'replace-with-local-pbx-identity', 'pbx' => 'pbx-01', 'status' => 'active', 'revision' => 1],
+            '12025550102' => ['account' => 'account-01', 'service' => 'replace-with-local-pbx-identity', 'pbx' => 'pbx-01', 'status' => 'active', 'revision' => 1],
+        ],
         'pbx' => ['pbx-01' => ['account' => 'account-01', 'status' => 'active', 'service' => 'replace-with-local-pbx-identity']],
         'voice' => [
             'voice-01' => ['account' => 'account-01', 'status' => 'active', 'max_channels' => 2, 'numbers' => ['12025550101']],

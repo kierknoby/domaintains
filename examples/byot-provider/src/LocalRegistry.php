@@ -7,6 +7,17 @@ final class LocalBilling implements BillingAdapter
 {
     public function __construct(private readonly array $records) {}
 
+    public function emergencyAssignment(string $account, string $service, string $pbx, string $number): string
+    {
+        $assignment = $this->records['number_assignments'][$number] ?? null;
+        if (!is_array($assignment) || ($assignment['account'] ?? null) !== $account || ($assignment['service'] ?? null) !== $service || ($assignment['pbx'] ?? null) !== $pbx
+            || ($assignment['status'] ?? null) !== 'active' || !is_int($assignment['revision'] ?? null) || $assignment['revision'] < 1
+            || (isset($assignment['expires_at']) && $assignment['expires_at'] <= time())) {
+            throw new ProviderException(403, 'Emergency number assignment not authorised.');
+        }
+        return (string)$assignment['revision'];
+    }
+
     public function pbx(string $account, string $pbx): array
     {
         return $this->owned('pbx', $account, $pbx);

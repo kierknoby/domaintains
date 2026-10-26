@@ -152,7 +152,18 @@ provider has complete local simulations and replaceable integration contracts,
 not commercial carrier connectors or an operational telephone network.
 
 The project is under active development. The current module version is
-`0.5.0-dev`.
+`0.6.0-dev`.
+
+## 0.6.0-dev Emergency Registration
+
+Building on the committed 0.5.0-dev BYOT foundation, this release adds
+provider-neutral emergency registration to the operator-side reference:
+retrieval, submission/update, explicit provider status, Individual/Business forms,
+current customer/service/PBX/number isolation, confirmation, replay protection and
+server-side rate limiting. There is no local emergency address database, no
+activation-token customer login and no automatic emergency Caller ID change.
+The integration is disabled until customer authentication and the provider
+adapter are configured. See the [emergency operator guide](examples/byot-provider/EMERGENCY.md).
 
 ## 0.5.0-dev BYOT Implementation
 
