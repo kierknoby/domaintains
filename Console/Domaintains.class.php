@@ -21,8 +21,8 @@ class Domaintains extends Command {
 	protected function configure() {
 		$this->setName('domaintains')
 			->setDescription('Activate DOMAINTAINS and inspect local activation status')
-			->addArgument('action', InputArgument::OPTIONAL, 'Action: status, activate, deactivate, reactivate, endpoint or adopt', 'status')
-			->addArgument('value', InputArgument::OPTIONAL, 'Complete HTTPS provisioning endpoint (endpoint action only)', null)
+			->addArgument('action', InputArgument::OPTIONAL, 'Action: status, identity, routing, activate, deactivate, reactivate, endpoint or adopt', 'status')
+			->addArgument('value', InputArgument::OPTIONAL, 'Complete HTTPS endpoint or explicit routing-pattern JSON', null)
 			->addOption('json', null, InputOption::VALUE_NONE, 'Return machine-readable JSON');
 	}
 
@@ -35,6 +35,23 @@ class Domaintains extends Command {
 		$action = strtolower(trim((string)$input->getArgument('action')));
 		if ($action === '') {
 			$action = 'status';
+		}
+		if ($action === 'identity') {
+			try {
+				$service = \FreePBX::Domaintains()->getServiceIdentity();
+				$output->writeln($input->getOption('json') ? json_encode(['service' => $service], JSON_UNESCAPED_SLASHES) : $service);
+				return 0;
+			} catch (\Throwable $e) {
+				return $this->outputResult(['success' => false, 'message' => 'Unable to read PBX identity safely.'], $input, $output);
+			}
+		}
+		if ($action === 'routing') {
+			$value = $input->getArgument('value');
+			$patterns = is_string($value) && strlen($value) <= 65536 ? json_decode($value, true, 8) : null;
+			if (!is_array($patterns)) {
+				return $this->outputResult(['success' => false, 'message' => 'Supply an explicit JSON array of outbound route patterns.'], $input, $output);
+			}
+			return $this->outputResult(\FreePBX::Domaintains()->configureRoutingPolicy($patterns), $input, $output);
 		}
 		if ($action === 'endpoint') {
 			$value = $input->getArgument('value');
@@ -120,7 +137,7 @@ class Domaintains extends Command {
 		}
 
 		if ($action !== 'status') {
-			$output->writeln('<error>Unknown action. Use status, activate, deactivate, reactivate, endpoint or adopt.</error>');
+			$output->writeln('<error>Unknown action. Use status, identity, routing, activate, deactivate, reactivate, endpoint or adopt.</error>');
 			return 1;
 		}
 

@@ -13,7 +13,7 @@ namespace FreePBX\modules;
 class Domaintains implements \BMO {
 
 	/** Fallback only. Authoritative version lives in module.xml. */
-	const VERSION = '0.4.1-dev';
+	const VERSION = '0.5.0-dev';
 	const TRUNK_NAME = 'DOMAINTAINS';
 	const ROUTE_NAME = 'DOMAINTAINS-Outbound';
 	const TEST_DESTINATION = 'domaintains-test,s,1';
@@ -39,7 +39,7 @@ class Domaintains implements \BMO {
 	public function backup(): array { return []; }
 	public function restore($backup): void {}
 	public function doConfigPageInit($page): void {
-		if (!isset($_SERVER['REQUEST_METHOD']) || strtoupper($_SERVER['REQUEST_METHOD']) !== 'POST' || !isset($_POST['domaintains_action']) || !in_array($_POST['domaintains_action'], ['activate', 'deactivate', 'reactivate', 'endpoint'], true)) {
+		if (!isset($_SERVER['REQUEST_METHOD']) || strtoupper($_SERVER['REQUEST_METHOD']) !== 'POST' || !isset($_POST['domaintains_action']) || !in_array($_POST['domaintains_action'], ['activate', 'deactivate', 'reactivate', 'endpoint', 'identity'], true)) {
 			return;
 		}
 
@@ -52,6 +52,14 @@ class Domaintains implements \BMO {
 
 		unset($_SESSION['domaintains_csrf']);
 		$action = $_POST['domaintains_action'];
+		if ($action === 'identity') {
+			try {
+				$this->setGuiMessage(true, _('PBX identity: ') . $this->getServiceIdentity());
+			} catch (\Throwable $e) {
+				$this->setGuiMessage(false, _('Unable to read PBX identity safely.'));
+			}
+			return;
+		}
 		if ($action === 'endpoint') {
 			$result = $this->configureProvisioningEndpoint(isset($_POST['provisioning_endpoint']) && is_string($_POST['provisioning_endpoint']) ? $_POST['provisioning_endpoint'] : '');
 			$this->setGuiMessage($result['success'], $result['message']);
@@ -231,6 +239,15 @@ class Domaintains implements \BMO {
 			$stage = 'remote';
 			$request = $this->signedActivationRequest($activationKey, $publicKey, $secretKey, $localService);
 			$responseValues = $this->validateActivationResponse($this->sendActivationRequest($request), $localService);
+			foreach ($responseValues['trunks'] as $trunk) {
+				if ($trunk['role'] === 'outbound') {
+					try {
+						$this->outboundRoutePatterns($localService);
+					} catch (\Throwable $e) {
+						return ['success' => false, 'message' => _('Configure a valid explicit outbound routing policy before neutral activation. Retained state and PBX configuration were not changed.'), 'stage' => 'local'];
+					}
+				}
+			}
 			$state = array_merge($responseValues, [
 				'provisioned' => false,
 				'activated_at' => $this->currentTime(),
@@ -637,13 +654,84 @@ class Domaintains implements \BMO {
 	}
 
 	private function validatedLocalServiceIdentity(): string {
-		$hostname = strtolower(trim($this->localHostname()));
-		$labelSeparator = strpos($hostname, '.');
-		$service = $labelSeparator === false ? $hostname : substr($hostname, 0, $labelSeparator);
-		if (!preg_match('/^my-[0-9]{8}$/D', $service)) {
-			throw new \RuntimeException('Invalid local service identity.');
+		$identity = $this->readProtectedJson('identity.json');
+		$state = $this->readActivationState();
+		if ($identity !== null) {
+			if (array_keys($identity) !== ['version', 'service'] || $identity['version'] !== 1 || !is_string($identity['service'])
+				|| !preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/D', $identity['service'])
+				|| ($state !== null && $state->service !== $identity['service'])) {
+				throw new \RuntimeException('Invalid local service identity.');
+			}
+			return $identity['service'];
 		}
+		if ($state !== null) {
+			$service = $state->service;
+		} else {
+			$hostname = strtolower(trim($this->localHostname()));
+			$labelSeparator = strpos($hostname, '.');
+			$service = $labelSeparator === false ? $hostname : substr($hostname, 0, $labelSeparator);
+			if (!preg_match('/^my-[0-9]{8}$/D', $service)) {
+				if (file_exists($this->storageDirectory() . '/signing.key') || is_link($this->storageDirectory() . '/signing.key')) {
+					throw new \RuntimeException('Invalid local service identity.');
+				}
+				$service = 'pbx-' . bin2hex(random_bytes(16));
+			}
+		}
+		$this->writeProtectedJson('identity.json', ['version' => 1, 'service' => $service]);
 		return $service;
+	}
+
+	public function getServiceIdentity(): string {
+		$lock = $this->lockActivationState();
+		try {
+			return $this->validatedLocalServiceIdentity();
+		} finally {
+			flock($lock, LOCK_UN);
+			fclose($lock);
+		}
+	}
+
+	public function configureRoutingPolicy(array $patterns): array {
+		$lock = null;
+		try {
+			$lock = $this->lockActivationState();
+			$patterns = $this->validateRoutingPatterns($patterns);
+			if (preg_match('/^my-[0-9]{8}$/D', $this->validatedLocalServiceIdentity())) {
+				throw new \RuntimeException('Legacy routing policy cannot be replaced.');
+			}
+			$policy = ['version' => 1, 'patterns' => $patterns];
+			if ($this->readProtectedJson('routing.json') === $policy) {
+				return ['success' => true, 'message' => _('Routing policy is already configured.')];
+			}
+			$this->readOwnershipState();
+			if ($this->readActivationState() !== null || $this->findManagedRoute($this->routingApi()) !== null) {
+				throw new \RuntimeException('Retained configuration requires ownership-reviewed routing changes.');
+			}
+			$this->writeProtectedJson('routing.json', $policy);
+			return ['success' => true, 'message' => _('Explicit outbound routing policy saved.')];
+		} catch (\Throwable $e) {
+			return ['success' => false, 'message' => _('Routing policy was not changed. Use a valid neutral-installation policy before activation; retained routes require explicit ownership review.')];
+		} finally {
+			if (is_resource($lock)) { flock($lock, LOCK_UN); fclose($lock); }
+		}
+	}
+
+	private function validateRoutingPatterns(array $patterns): array {
+		if (count($patterns) < 1 || count($patterns) > 128 || array_values($patterns) !== $patterns) {
+			throw new \RuntimeException('Invalid routing policy.');
+		}
+		foreach ($patterns as $pattern) {
+			if (!is_array($pattern) || count($pattern) !== 4) { throw new \RuntimeException('Invalid routing policy.'); }
+			foreach (['prepend_digits', 'match_pattern_prefix', 'match_pattern_pass', 'match_cid'] as $field) {
+				if (!isset($pattern[$field]) || !is_string($pattern[$field]) || strlen($pattern[$field]) > 64) { throw new \RuntimeException('Invalid routing policy.'); }
+			}
+			if (!preg_match('/^[0-9*#+]*$/D', $pattern['prepend_digits']) || !preg_match('/^[0-9*#+]*$/D', $pattern['match_pattern_prefix'])
+				|| !preg_match('/^(?:[0-9XZN*#+]|\[[0-9XZN-]+\])+[.!]?$/D', $pattern['match_pattern_pass'])
+				|| ($pattern['match_cid'] !== '' && !preg_match('/^(?:[0-9XZN*#+]|\[[0-9XZN-]+\])+[.!]?$/D', $pattern['match_cid']))) {
+				throw new \RuntimeException('Invalid routing policy.');
+			}
+		}
+		return $patterns;
 	}
 
 	protected function supportsSodium(): bool {
@@ -743,7 +831,7 @@ class Domaintains implements \BMO {
 				throw new \RuntimeException('Activation state has an invalid local field.');
 			}
 		}
-		if (!preg_match('/^my-[0-9]{8}$/D', $values['service']) || !is_array($values['trunks']) || count($values['trunks']) === 0) {
+		if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/D', $values['service']) || !is_array($values['trunks']) || count($values['trunks']) === 0) {
 			throw new \RuntimeException('Activation state has an invalid service or trunk list.');
 		}
 		if (!is_int($values['max_channels']) || $values['max_channels'] < 1 || $values['max_channels'] > 500) {
@@ -1657,7 +1745,11 @@ class Domaintains implements \BMO {
 
 	protected function outboundRoutePatterns(string $service): array {
 		if (!preg_match('/^my-([0-9]{8})$/D', $service, $matches)) {
-			throw new \RuntimeException('The authorized service identity is invalid.');
+			$policy = $this->readProtectedJson('routing.json');
+			if ($policy === null || array_keys($policy) !== ['version', 'patterns'] || $policy['version'] !== 1 || !is_array($policy['patterns'])) {
+				throw new \RuntimeException('An explicit neutral outbound routing policy is required.');
+			}
+			return $this->validateRoutingPatterns($policy['patterns']);
 		}
 		$pbxTag = $matches[1];
 		$tagPrefix = $pbxTag . '*';

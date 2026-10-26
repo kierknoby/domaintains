@@ -145,14 +145,44 @@ not silently discarded. These operations do not create a new signing identity.
 
 # For Developers and Service Providers
 
-This repository contains the PBX-side implementation. A compatible provisioning
-service is required for activation, but developers can build that service around
-their own systems. The interface between the module and that service is the
-public integration boundary; everything behind the service is implementation-
-specific.
+This repository contains the PBX module and an independent BYOT reference
+provider under [examples/byot-provider](examples/byot-provider/README.md).
+A compatible operator provisioning service is required for activation. The
+provider has complete local simulations and replaceable integration contracts,
+not commercial carrier connectors or an operational telephone network.
 
 The project is under active development. The current module version is
-`0.4.1-dev`.
+`0.5.0-dev`.
+
+## 0.5.0-dev BYOT Implementation
+
+New non-legacy installations persist an unpredictable `pbx-` identity separately
+from hostname, activation and signing state. Discover it using
+`fwconsole domaintains identity` or the CSRF-protected Show PBX identity action.
+Retained service identities take precedence; existing `my-########` identities,
+signing keys, ownership, fingerprints and native IDs are not migrated.
+
+Neutral outbound routing has no built-in dialling policy. Before activation,
+the administrator must supply an explicit pattern array using
+`fwconsole domaintains routing '<JSON array>'`; see the provider guide for a
+synthetic example. Legacy installations retain their exact existing policy.
+Neither command modifies Firewall configuration. Local Deactivate preserves
+both identity and routing policy as well as the original protected stores.
+
+The standalone PHP 8.2+ provider implements order-driven preparation and
+customer-initiated linking, multi-service entitlement aggregation, expiring
+hashed credentials, rotation/revocation, atomic key binding, replay protection,
+throttling, per-service orchestration and independently verified numbering,
+optional DNS and separate SIP edges. Its deterministic adapters are simulations.
+Real connectors implement the same interfaces; no private operator code is
+included. See the [operator guide](examples/byot-provider/README.md).
+
+Actual module Ed25519 requests traverse the complete reference runtime and
+actual module validator/reconciliation in tests. Adapter failures, safe retry,
+owned stale removal, unowned conflicts and real cross-process races are tested.
+No new live FreePBX 16/17, carrier or test-call trials have been performed.
+Those remain mandatory controlled acceptance gates before operational use.
+There is no remote PBX teardown or lifecycle event transport.
 
 ## 0.4.1-dev Security Patch
 
@@ -169,8 +199,8 @@ The preceding baseline has been tested on a provisioned FreePBX 17 installation
 with six adopted objects. That does not constitute live validation of this
 security patch; its privilege boundary and native IPv6 behaviour still require
 controlled FreePBX 16/17 integration testing. This is not a production release.
-BYOT integration is reserved for `0.5.0-dev`; reference handoffs are separate
-artifacts and are not included in this security patch.
+BYOT was outside the scope of this historical security patch; its implementation
+is described in the 0.5.0-dev section above.
 
 ## 0.4.0-dev Milestone
 
@@ -208,9 +238,11 @@ Not implemented in this release:
   owned configuration subject to its safety and reference checks.
 - Authoritative lifecycle revision handling.
 
-These remain future work. This release introduces no cron, polling, background
-service or inbound lifecycle listener. The existing UK outbound-routing policy
-also remains unchanged.
+These exclusions describe the historical 0.4.0 release. In 0.5.0-dev neutral
+identity and provider-side revisions are implemented; remote lifecycle delivery
+and selective PBX teardown remain future work. No cron, polling, background
+service or inbound lifecycle listener is introduced. The legacy UK policy is
+unchanged and is not applied to new neutral identities.
 
 ## Architecture
 
@@ -303,6 +335,8 @@ Asterisk-owned sensitive files at `0600`, including commands invoked from root:
 | `state.json` | Retained provider authorization and desired configuration; removed by local Deactivate. |
 | `ownership.json` | Durable verified object identities, configuration digests, recording time and created/adopted origin. |
 | `endpoint.json` | Administrator-selected provisioning endpoint. |
+| `identity.json` | Persistent local service identity, independent of hostname and local unlink. |
+| `routing.json` | Explicit administrator-selected neutral outbound route patterns. |
 | `test-destination.json` | Module-local test destination registration. |
 
 Endpoint and ownership writes share the activation lock, permission/ownership
@@ -412,7 +446,7 @@ The public activation lifecycle is:
 3. The provisioning service creates an activation token.
 4. The token is supplied to the PBX administrator.
 5. The PBX creates or loads its persistent signing identity.
-6. The PBX derives its local service identity from its hostname.
+6. The PBX loads its retained local service identity or creates a neutral identity (preserving valid legacy hostname identities).
 7. The PBX sends a signed activation claim to the provisioning service over HTTPS.
 8. The provisioning service validates the claim and authorises the activation
   for its service.
@@ -436,9 +470,9 @@ field order:
 2. `public_key`: the PBX signing public key, base64 encoded.
 3. `timestamp`: the claim creation time as an integer.
 4. `nonce`: 24 cryptographically random bytes, base64 encoded.
-5. `service`: the local service identity derived from the PBX hostname.
+5. `service`: the persistent local service identity.
 
-The local `service` value must match `^my-[0-9]{8}$` and is part of the
+The local `service` value must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` and is part of the
 signature. Signing the claim binds its contents to the PBX signing identity and
 helps the provisioning service validate freshness and prevent replay. The
 provisioning service defines its own activation and claim-validation policy.
@@ -451,7 +485,7 @@ provider metadata.
 
 | Field | Required value |
 | --- | --- |
-| `service` | Non-empty service identity matching the PBX's local identity and `^my-[0-9]{8}$`. |
+| `service` | Exact local identity matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; cannot be assigned or changed by the response. |
 | `profile` | Non-empty provider-defined string, at most 1,024 bytes; its meaning is not interpreted by the PBX module. |
 | `domaintains_hostname` | Non-empty string, at most 1,024 bytes, supplied as part of the authorised service configuration. |
 | `trunks` | 1 through 64 unique trunk entries. Each entry has `role` (`inbound` or `outbound`), validated `sip_host`, and integer `sip_port` from 1 through 65535. |
@@ -619,11 +653,11 @@ any PBX-facing credentials are specific to a compatible provider integration.
 
 ## What Is Not Included
 
-This repository contains the PBX-side module. It does not provide a billing
-platform, carrier account, telephone-number inventory, DNS hosting, SBC
-infrastructure, or a provisioning backend. Developers may implement compatible
-services for those roles using their own systems; none of those particular
-systems is required by the public module contract.
+The repository includes a standalone reference provisioning backend and local
+simulations, but not a commercial billing platform, carrier account, real number
+inventory, DNS hosting or deployed SBC infrastructure. Operators must implement
+and validate real connectors against their documented management APIs. No
+specific vendor is required by the public module contract.
 
 ## Development and Testing
 
@@ -633,13 +667,20 @@ fixtures and API doubles rather than live provider infrastructure. Run the
 contracts with:
 
 ```sh
-for test in tests/*_contract.php; do php "$test" || exit 1; done
+for test in tests/*_contract.php examples/byot-provider/tests/*contract.php; do php -d extension=sodium "$test" || exit 1; done
 ```
 
 Run PHP syntax checks on changed PHP files and `git diff --check` before
 submitting changes. Do not put real activation tokens, public service
 identifiers, telephone numbers, hostnames, addresses or provider credentials in
 public fixtures.
+
+The 0.5.0-dev read-only history check found the former provider-specific
+provisioning endpoint in pre-existing commits. It was not copied into the new
+reference provider; history was not changed. The maintainer must review that
+historical disclosure before any publication. An automated credential-pattern
+scan is not proof that a repository contains no secrets. No commit, push, tag,
+publication, release or deployment is part of this implementation work.
 
 ## Repository
 

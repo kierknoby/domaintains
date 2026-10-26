@@ -754,8 +754,9 @@ $directory = activation_temp_directory();
 $invalidHostModule = new ActivationContractModule($directory, [activation_fixture_response()]);
 $invalidHostModule->localHostnameValue = 'pbx.example.invalid';
 $invalidHostResult = $invalidHostModule->activate('synthetic-test-token');
-activation_assert(!$invalidHostResult['success'] && $invalidHostResult['stage'] === 'local' && $invalidHostModule->requests() === [], 'invalid local service identity must fail before sending an activation claim');
-activation_assert(!file_exists($directory . '/signing.key') && $invalidHostModule->firewallFixture()->addCalls === 0, 'invalid local service identity must not create identity state or modify the firewall');
+activation_assert(!$invalidHostResult['success'] && $invalidHostResult['stage'] === 'remote' && count($invalidHostModule->requests()) === 1, 'neutral identity must still reject a provider response for a different service');
+activation_assert((bool)preg_match('/^pbx-[a-f0-9]{32}$/D', json_decode($invalidHostModule->requests()[0], true)['claim']['service']), 'non-legacy hostname must establish a random neutral identity');
+activation_assert(!file_exists($directory . '/state.json') && $invalidHostModule->coreFixture()->addCalls === 0 && $invalidHostModule->firewallFixture()->addCalls === 0, 'mismatched provider identity must not change PBX configuration or Firewall');
 activation_cleanup($directory);
 
 $directory = activation_temp_directory();

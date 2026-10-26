@@ -101,6 +101,11 @@ $provisioningEndpoint = isset($provisioningEndpoint) ? (string)$provisioningEndp
 
 	<div class="row">
 		<div class="col-md-8">
+			<form method="post">
+				<input type="hidden" name="domaintains_action" value="identity">
+				<input type="hidden" name="domaintains_csrf" value="<?php echo htmlspecialchars($activationCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
+				<button type="submit" class="btn btn-default"><?php echo _('Show PBX identity'); ?></button>
+			</form>
 			<form method="post" autocomplete="off">
 				<input type="hidden" name="domaintains_action" value="endpoint">
 				<input type="hidden" name="domaintains_csrf" value="<?php echo htmlspecialchars($activationCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
