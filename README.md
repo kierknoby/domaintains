@@ -70,6 +70,14 @@ administration agent, billing system, carrier, DNS service or replacement
 FreePBX distribution. Its public implementation is scoped to activation and the
 reconciliation of its own service-related FreePBX configuration.
 
+## Operator Integration
+
+DOMAINTAINS supports integration with external ordering, subscription management, provisioning, billing and telephone number providers.
+
+The [operator number-search integration](examples/operator-number-search/README.md) provides a reusable number discovery and selection interface, with configurable adapters and reference implementations.
+
+These integrations operate independently of the FreePBX module, allowing operators to connect DOMAINTAINS to their existing infrastructure.
+
 ## Administrator Security Overview
 
 - The PBX uses a persistent cryptographic signing identity for activation.
@@ -152,7 +160,65 @@ provider has complete local simulations and replaceable integration contracts,
 not commercial carrier connectors or an operational telephone network.
 
 The project is under active development. The current module version is
-`0.6.0-dev`.
+`0.7.0-dev`.
+
+## 0.7.0-dev Operator Number Search
+
+This independently reviewed development milestone adds the
+[provider-neutral operator number-search integration](examples/operator-number-search/README.md)
+under `examples/operator-number-search/`. It is separate from the FreePBX module
+and private commercial infrastructure. It is not a stable version, a release or
+evidence of production readiness. The approved implementation and existing
+activation, ownership, emergency registration, BYOT and billing behaviour are
+unchanged by this version update.
+
+**Number discovery:** A shared telephone-number availability and selection
+interface supports three independent OR search patterns, matching only subscriber
+digits after the selected area code. Search, Stop and Clear, manual Refresh
+Availability List and progressive discovery retain explicit customer control,
+with at most six sequential requests per search click and up to 20 numbers per
+batch. Recommendations, distinctive field colours and overlapping highlights,
+See more/See less, selection preservation and canonical duplicate prevention
+are covered by automated regressions.
+
+**Operator integration:** Configurable customer authorisation and product/
+subscription identification are separate from ordering/cart integration, carrier
+availability, provisioning/activation and billing preflight/reconciliation.
+BYOT-compatible reference implementations use synthetic data and independent
+adapters, without requiring or identifying a specific ordering or billing platform.
+Search and checkout verification do not allocate, activate or bill.
+
+**Security and reliability:** Server-side selection verification isolates accounts,
+products and resources. Multiple cart items have independent selection fields,
+radio groups and Refresh IDs. Authoritative immutable originating-item checks
+prevent cross-item receipt reuse, including within the same account and product.
+Carrier-offer evidence expires without renewal through checkout timestamps.
+The adapter contracts require authoritative duplicate-allocation and idempotency
+guards and controlled recording/review of partial provisioning outcomes;
+simulations test that flow, not production durability. Availability uses a shared
+five-second limiter, bounded queuing and private CSV/JSONL operational auditing.
+
+**Testing and documentation:** Public operator contracts, simulated carrier and
+ordering fixtures, automated search/security/lifecycle tests, concurrency and
+rate-limiting regressions, installation/configuration guidance and production
+integration/acceptance checklists accompany the milestone. Source-fidelity tests
+preserve the canonical search algorithm; simulated tests do not establish real
+telephone connectivity, carrier allocation or financial correctness.
+
+**Outstanding production verification:**
+
+- Genuine desktop and mobile browser testing, including accessibility and proxy
+  disconnect behaviour.
+- Real operator adapter configuration.
+- Ordering and subscription lifecycle verification on the actual platform.
+- Production provisioning and billing integration and uncertain-outcome recovery.
+- Shared Magrathea request-limiting coverage across every availability consumer,
+  including other pages, workers and hosts.
+- Controlled staging acceptance.
+- Final production deployment approval, separately authorised by the owner.
+
+See the [operator acceptance checklist](examples/operator-number-search/REVIEW.md).
+None of these outstanding activities is represented as completed by `0.7.0-dev`.
 
 ## 0.6.0-dev Emergency Registration
 

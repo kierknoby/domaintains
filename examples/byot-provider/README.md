@@ -2,7 +2,14 @@
 
 This is an **independent telecoms operator's HTTPS activation endpoint**, not a FreePBX module. It is designed to be bundled under `examples/byot-provider/` in the public DOMAINTAINS repository. It has no dependencies on any particular provider's billing, DNS, SIP routing or hosting infrastructure.
 
-The **0.5.0-dev** BYOT foundation established persistent neutral identities while retaining existing identities. The current **0.6.0-dev** release adds provider-neutral emergency registration. This standalone application implements the compatible flat activation protocol plus billing/service linking, numbering, reachability, optional DNS and two independently replaceable SIP edges. The default infrastructure adapters are **simulations**, not vendor connectors. They cannot establish or prove live telephone connectivity.
+The **0.5.0-dev** BYOT foundation established persistent neutral identities while retaining existing identities. The **0.6.0-dev** development milestone introduced provider-neutral emergency registration. This standalone application implements the compatible flat activation protocol plus billing/service linking, numbering, reachability, optional DNS and two independently replaceable SIP edges. The default infrastructure adapters are **simulations**, not vendor connectors. They cannot establish or prove live telephone connectivity.
+
+The current DOMAINTAINS development version is **0.7.0-dev**, adding the independent
+[operator number-search integration](../operator-number-search/README.md) with
+provider-neutral ordering, provisioning and billing adapters. This milestone does
+not alter the BYOT or emergency implementation and is not a production release.
+Real adapters, lifecycle/provisioning/billing verification, browser tests, shared
+carrier limiting and controlled staging acceptance remain operator requirements.
 
 ## Directory structure
 

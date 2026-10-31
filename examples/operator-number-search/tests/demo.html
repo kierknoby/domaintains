@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Number Selection Test Fixture</title>
+    <style>
+        *{box-sizing:border-box}body{font-family:Georgia,serif;margin:0;background:#f6f8fa;color:#233333}
+        main{max-width:1050px;margin:36px auto;padding:0 20px}h1{font-size:24px;letter-spacing:0}
+        .form-control{font:16px Georgia,serif;border:1px solid #c9d3d9;border-radius:5px;padding:7px;background:#fff}
+        label{margin-bottom:5px}button{font-family:Georgia,serif}#fixture-option{display:none}
+    </style>
+</head>
+<body>
+<main>
+    <h1>Telephone Number</h1>
+    <form>
+        <input id="fixture-option" type="hidden">
+        <div id="fixture-target"></div>
+        <input id="fixture-selection" name="selected_number" type="hidden">
+    </form>
+</main>
+<script>
+    window.fetch = function (url, options) {
+        if (url !== '/fixture-availability') { return Promise.reject(new Error('No external transport permitted')); }
+        var params = new URLSearchParams(options.body);
+        var prefix = params.get('prefix');
+        var numbers = Array.from({length:20}, function (unused, index) {
+            var subscriber = String(1234500 + index).slice(-(11-prefix.length));
+            return {number:'44'+prefix.slice(1)+subscriber,recommended:index<3};
+        });
+        return Promise.resolve({status:200,ok:true,json:function () { return Promise.resolve({ok:true,numbers:numbers}); }});
+    };
+</script>
+<script src="../public/dn-progressive-search.js"></script>
+<script src="../public/number-picker.js"></script>
+<script>
+    DNNumberPickerMount({context:'cart-0',mode:'cart',targetId:'fixture-target',anchorId:'fixture-option',fieldId:'fixture-selection',selectionFieldName:'selected_number',
+        nonce:'fixture-only',availabilityUrl:'/fixture-availability',
+        regions:{England:{London:{'0204':'London (fixture)'}},Scotland:{Glasgow:{'0141':'Glasgow (fixture)'}}}});
+</script>
+</body>
+</html>
